@@ -1,0 +1,3 @@
+# rules.d/blocked_domains.txt
+evil.com
+tracker.example.org

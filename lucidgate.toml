@@ -1,0 +1,59 @@
+[server]
+listen_addr = "127.0.0.1:8080"
+cert_dir = "certs"
+handshake_timeout = "5s"
+max_connections = 100
+io_timeout = "10s"
+
+[upstream]
+dial_timeout = "5s"
+insecure_skip_verify = false
+
+[logging]
+log_bodies = true
+max_capture_bytes = 1048576
+dump_dir = "dumps"
+
+[rules]
+include_dir = ["rules.d"]
+
+[[access.profile]]
+name = "admin"
+default = true
+clients =["127.0.0.1/32"]
+
+[semantic]
+blocked_phrases = ["monja", "conejo"]
+score_threshold = 100
+
+[[semantic.weighted_phrase]]
+phrase = "malware"
+weight = 60
+
+[[semantic.weighted_phrase]]
+phrase = "payload"
+weight = 50
+
+[masking]
+phrases = ["apikey-12345"]
+
+[injection]
+# html_banner = "<div style=\"position:fixed;top:0;width:100%;background:red;color:white;text-align:center;z-index:9999\">LUCIDGATE INTERCEPTADO</div>"
+
+[magic]
+blocked_types =["executable/pe", "executable/elf"]
+
+[antivirus]
+enabled = false
+clamav_addr = "127.0.0.1:3310"
+temp_dir = "/tmp"
+trickle_interval = "1s"
+scan_timeout = "30s"
+
+[[substitution.rule]]
+search = "Europa"
+replace = "América"
+
+[[substitution.rule]]
+search = "Real Madrid"
+replace = "Súper Real Madrid"
