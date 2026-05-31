@@ -1,0 +1,4 @@
+# LucidGate regexp substitution rules.
+# Syntax: pattern => replace
+# Patterns use Go/RE2 regexp. Capture replacements like $1 are supported.
+ca.*sa\.png => carcasa.png

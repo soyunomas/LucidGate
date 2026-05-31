@@ -4,26 +4,32 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
-	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
 )
 
 // BodyBytesNotCaptured is returned in log fields when the body length is
@@ -44,6 +50,33 @@ var relayBufferPool = sync.Pool{
 	},
 }
 
+var pool4K = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 4096)
+		return &buf
+	},
+}
+
+var pool32K = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
+var pool64K = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 64*1024)
+		return &buf
+	},
+}
+
+var bufioReaderPool = sync.Pool{
+	New: func() any {
+		return bufio.NewReaderSize(nil, 4096)
+	},
+}
+
 // RelayOptions controls request/response body capture behaviour.
 //
 //   - LogBodies + MaxCaptureBytes drive the legacy in-memory capture used to
@@ -52,16 +85,30 @@ var relayBufferPool = sync.Pool{
 //     of every textual request and response to a single JSONL file inside that
 //     directory, intended for offline Blue-Team inspection.
 type RelayOptions struct {
-	LogBodies       bool
-	MaxCaptureBytes int64
-	DumpDir         string
-	IOTimeout       time.Duration
-	Filter          FilterEngine
-	RequestFilter   FilterEngine
+	LogBodies                bool
+	LogBodiesSampleRate      float64
+	MaxCaptureBytes          int64
+	DumpDir                  string
+	DumpOnPolicyHit          bool
+	DumpCredentialsCleartext bool
+	AuditKey                 string
+	DumpMaxSizeMB            int
+	DumpMaxBackups           int
+	DumpMinFreeSpaceMB       int64
+	DumpCompress             bool
+	IOTimeout                time.Duration
+	WSIdleTimeout            time.Duration
+	Filter                   FilterEngine
+	RequestFilter            FilterEngine
+	Policy                   *Policy
+	RoundTripH2              func(*http.Request) (*http.Response, error)
+	H2Hosts                  *sync.Map
+	HTTP3Enabled             bool
+	HTTP3Port                string
 }
 
 type FilterEngine interface {
-	ProcessChunk(in[]byte) (out[]byte, blocked bool, err error)
+	ProcessChunk(in []byte) (out []byte, blocked bool, err error)
 }
 
 type filterFactory interface {
@@ -75,8 +122,109 @@ func (passThroughFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
 }
 
 func relayHTTP(localConn net.Conn, upstreamConn net.Conn, logger *slog.Logger, opts RelayOptions) error {
-	localReader := bufio.NewReader(localConn)
-	upstreamReader := bufio.NewReader(upstreamConn)
+	return relayHTTPConn(localConn, upstreamConn, nil, logger, opts)
+}
+
+func relayHTTPDial(localConn net.Conn, dial func() (net.Conn, error), logger *slog.Logger, opts RelayOptions) error {
+	return relayHTTPConn(localConn, nil, dial, logger, opts)
+}
+
+func relayHTTPLease(localConn net.Conn, acquire func() (*upstreamConnLease, error), logger *slog.Logger, opts RelayOptions) error {
+	return relayHTTPConnLease(localConn, nil, nil, acquire, logger, opts)
+}
+
+func relayHTTPConn(localConn net.Conn, upstreamConn net.Conn, dial func() (net.Conn, error), logger *slog.Logger, opts RelayOptions) error {
+	return relayHTTPConnLease(localConn, upstreamConn, dial, nil, logger, opts)
+}
+
+func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (net.Conn, error), acquire func() (*upstreamConnLease, error), logger *slog.Logger, opts RelayOptions) error {
+	brRef := bufioReaderPool.Get().(*bufio.Reader)
+	brRef.Reset(localConn)
+	defer func() {
+		brRef.Reset(nil)
+		bufioReaderPool.Put(brRef)
+	}()
+	localReader := brRef
+	var upstreamReader *bufio.Reader
+	var releaseUpstream func(bool)
+	if upstreamConn != nil {
+		upstreamReader = bufio.NewReader(upstreamConn)
+	}
+	releaseCurrent := func(reusable bool) {
+		if upstreamConn == nil {
+			return
+		}
+		if releaseUpstream != nil {
+			releaseUpstream(reusable)
+		} else if dial != nil || acquire != nil {
+			_ = upstreamConn.Close()
+		}
+		upstreamConn = nil
+		upstreamReader = nil
+		releaseUpstream = nil
+	}
+	defer func() {
+		releaseCurrent(false)
+	}()
+
+	exchanges := 0
+	var doH2RoundTrip func(*http.Request, string) error
+	if opts.RoundTripH2 != nil {
+		doH2RoundTrip = func(req *http.Request, host string) error {
+			req.URL.Scheme = "https"
+			req.URL.Host = host
+			req.RequestURI = ""
+
+			resp, err := opts.RoundTripH2(req)
+			if err != nil {
+				closeRequestBody(req)
+				return fmt.Errorf("h2 roundtrip: %w", err)
+			}
+			closeRequestBody(req)
+
+			if stripHTTP3Advertising(resp.Header) {
+				AltSvcStripped.Inc()
+			}
+
+			if opts.HTTP3Enabled {
+				resp.Header.Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=86400`, opts.HTTP3Port))
+			}
+
+			if opts.Policy != nil {
+				if decision := opts.Policy.EvaluateResponse(resp, "https"); decision.Blocked {
+					closeResponseBody(resp)
+					RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+					logExchangeBlocked(logger, req, decision, opts)
+					if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+						return fmt.Errorf("deadline local policy response block write: %w", err)
+					}
+					_, _ = io.WriteString(localConn, policyBlockResponse())
+					return nil
+				}
+			}
+
+			respCap := newBodyCapture(resp.Body != nil, opts)
+			if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+				closeResponseBody(resp)
+				return fmt.Errorf("deadline local write: %w", err)
+			}
+			resp.Body = readCloserWithIdleDeadline(resp.Body, connReadDeadlineRefresher(localConn, opts.IOTimeout))
+			localWriter := writerWithIdleDeadline(localConn, connWriteDeadlineRefresher(localConn, opts.IOTimeout))
+			_, decision, err := writeResponseStreaming(localWriter, resp, respCap, opts.Filter)
+			if err != nil {
+				closeResponseBody(resp)
+				if decision.Blocked {
+					RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+					logExchangeBlocked(logger, req, decision, opts)
+				}
+				return fmt.Errorf("write local response: %w", err)
+			}
+			closeResponseBody(resp)
+
+			exchanges++
+			return nil
+		}
+	}
 
 	for {
 		if err := setReadDeadline(localConn, opts.IOTimeout); err != nil {
@@ -85,60 +233,352 @@ func relayHTTP(localConn net.Conn, upstreamConn net.Conn, logger *slog.Logger, o
 		req, err := http.ReadRequest(localReader)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
+				releaseCurrent(upstreamConn != nil && upstreamReader != nil && upstreamReader.Buffered() == 0)
+				return nil
+			}
+			if exchanges > 0 && isTimeoutError(err) {
+				releaseCurrent(upstreamConn != nil && upstreamReader != nil && upstreamReader.Buffered() == 0)
 				return nil
 			}
 			return fmt.Errorf("read local request: %w", err)
 		}
 
 		xid := newExchangeID()
-		SanitizeHeaders(req)
+		localClose := req.Close
+		isWS := isWebSocketUpgrade(req)
+		if !isWS {
+			SanitizeHeaders(req)
+		}
 		normalizeRequestURL(req)
+		req.Close = false
+		host := req.Host
+		if req.URL != nil && req.URL.Hostname() != "" {
+			host = req.URL.Hostname()
+		}
+		if opts.Policy != nil {
+			if decision := opts.Policy.EvaluateRequest(host, req, "https"); decision.Blocked {
+				closeRequestBody(req)
+				RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+				logExchangeBlocked(logger, req, decision, opts)
+				if isWS {
+					WebSocketSessions.WithLabelValues("denied").Inc()
+				}
+				if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+					return fmt.Errorf("deadline local policy block write: %w", err)
+				}
+				_, _ = io.WriteString(localConn, policyBlockResponse())
+				return nil
+			}
+		}
 
-		reqCap := newBodyCapture(req.Body != nil, opts)
-		if err := setWriteDeadline(upstreamConn, opts.IOTimeout); err != nil {
+		if isWS {
+			if upstreamConn == nil {
+				if acquire != nil {
+					lease, aerr := acquire()
+					if aerr != nil {
+						if errors.Is(aerr, errNegotiatedH2) {
+							WebSocketSessions.WithLabelValues("error").Inc()
+							closeRequestBody(req)
+							return fmt.Errorf("websocket over h2 not supported by upstream")
+						}
+						closeRequestBody(req)
+						return fmt.Errorf("dial upstream for ws: %w", aerr)
+					}
+					upstreamConn = lease.conn
+					upstreamReader = lease.reader
+					releaseUpstream = lease.release
+				} else if dial != nil {
+					var derr error
+					upstreamConn, derr = dial()
+					if derr != nil {
+						closeRequestBody(req)
+						return fmt.Errorf("dial upstream for ws: %w", derr)
+					}
+					upstreamReader = bufio.NewReader(upstreamConn)
+					releaseUpstream = func(bool) {
+						_ = upstreamConn.Close()
+					}
+				} else {
+					closeRequestBody(req)
+					return fmt.Errorf("missing upstream connection for ws")
+				}
+			}
+			// Clear deadlines so the WS handshake and bidi pump manage their own.
+			_ = localConn.SetDeadline(time.Time{})
+			_ = upstreamConn.SetDeadline(time.Time{})
+			wsIdle := opts.WSIdleTimeout
+			if wsIdle <= 0 {
+				wsIdle = DefaultWebSocketIdleTimeout
+			}
+			wsErr := relayWebSocket(localConn, upstreamConn, upstreamReader, req, opts.IOTimeout, wsIdle)
+			closeRequestBody(req)
+			// A WebSocket exchange always terminates the upstream connection
+			// for pool purposes: after raw bidi the connection state is no
+			// longer HTTP/1.1 idle.
+			releaseCurrent(false)
+			return wsErr
+		}
+
+		if doH2RoundTrip != nil && isHostH2(opts.H2Hosts, host) {
+			if err := doH2RoundTrip(req, host); err != nil {
+				return err
+			}
+			if localClose {
+				return nil
+			}
+			continue
+		}
+
+		if upstreamConn == nil {
+			if dial == nil && acquire == nil {
+				closeRequestBody(req)
+				return fmt.Errorf("missing upstream connection")
+			}
+			if acquire != nil {
+				lease, err := acquire()
+				if err != nil {
+					if errors.Is(err, errNegotiatedH2) {
+						if doH2RoundTrip != nil {
+							if err := doH2RoundTrip(req, host); err != nil {
+								return err
+							}
+							if localClose {
+								return nil
+							}
+							continue
+						}
+					}
+					closeRequestBody(req)
+					return fmt.Errorf("dial upstream: %w", err)
+				}
+				upstreamConn = lease.conn
+				upstreamReader = lease.reader
+				releaseUpstream = lease.release
+			} else {
+				var err error
+				upstreamConn, err = dial()
+				if err != nil {
+					closeRequestBody(req)
+					return fmt.Errorf("dial upstream: %w", err)
+				}
+				upstreamReader = bufio.NewReader(upstreamConn)
+				releaseUpstream = func(bool) {
+					_ = upstreamConn.Close()
+				}
+			}
+		}
+
+		exchangeOpts := opts
+		if opts.LogBodies && opts.LogBodiesSampleRate > 0 && opts.LogBodiesSampleRate < 1.0 {
+			if rand.Float64() >= opts.LogBodiesSampleRate {
+				exchangeOpts.LogBodies = false
+				exchangeOpts.DumpDir = ""
+			}
+		}
+
+		reqCap := newBodyCapture(req.Body != nil, exchangeOpts)
+		if err := setWriteDeadline(upstreamConn, exchangeOpts.IOTimeout); err != nil {
 			closeRequestBody(req)
 			return fmt.Errorf("deadline upstream write: %w", err)
 		}
-		reqBytes, err := writeRequestStreaming(upstreamConn, req, reqCap, opts.RequestFilter)
+		req.Body = readCloserWithIdleDeadline(req.Body, connReadDeadlineRefresher(localConn, exchangeOpts.IOTimeout))
+		upstreamWriter := writerWithIdleDeadline(upstreamConn, connWriteDeadlineRefresher(upstreamConn, exchangeOpts.IOTimeout))
+
+		var reqDumpFunc func(action string)
+		if exchangeOpts.DumpDir != "" {
+			reqDumpFunc = func(action string) {
+				data, trunc, skipped := reqCap.dumpPayload()
+				emitDump(exchangeOpts, "req", xid, req, nil, data, trunc, skipped, action, logger)
+			}
+		}
+		var reqDumped bool
+		safeReqDump := func(action string) {
+			if reqDumpFunc != nil && !reqDumped {
+				reqDumpFunc(action)
+				reqDumped = true
+			}
+		}
+
+		reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, req, reqCap, exchangeOpts.RequestFilter)
 		if err != nil {
 			closeRequestBody(req)
+			if !exchangeOpts.DumpOnPolicyHit || reqDec.Blocked {
+				safeReqDump(determineAction(req, nil, reqDec, PolicyDecision{}, exchangeOpts.Policy))
+			}
 			return fmt.Errorf("write upstream request: %w", err)
 		}
-		if opts.DumpDir != "" {
-			data, trunc, skipped := reqCap.dumpPayload()
-			emitDump(opts.DumpDir, "req", xid, req, nil, data, trunc, skipped, logger)
-		}
 		closeRequestBody(req)
+		if reqDec.Blocked {
+			RuleHits.WithLabelValues("default", reqDec.MatchType, "block").Inc()
+			logExchangeBlocked(logger, req, reqDec, exchangeOpts)
+			if !exchangeOpts.DumpOnPolicyHit || reqDec.Blocked {
+				safeReqDump("blocked")
+			}
+			if err := setWriteDeadline(localConn, exchangeOpts.IOTimeout); err != nil {
+				return fmt.Errorf("deadline local policy request block write: %w", err)
+			}
+			_, _ = io.WriteString(localConn, policyBlockResponse())
+			return nil
+		}
 
-		if err := setReadDeadline(upstreamConn, opts.IOTimeout); err != nil {
+		if err := setReadDeadline(upstreamConn, exchangeOpts.IOTimeout); err != nil {
+			if !exchangeOpts.DumpOnPolicyHit {
+				safeReqDump("allowed")
+			}
 			return fmt.Errorf("deadline upstream read: %w", err)
 		}
 		resp, err := http.ReadResponse(upstreamReader, req)
 		if err != nil {
+			if !exchangeOpts.DumpOnPolicyHit {
+				safeReqDump("allowed")
+			}
 			return fmt.Errorf("read upstream response: %w", err)
 		}
-		respCap := newBodyCapture(resp.Body != nil, opts)
-		if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
-			closeResponseBody(resp)
-			return fmt.Errorf("deadline local write: %w", err)
-		}
-		respBytes, err := writeResponseStreaming(localConn, resp, respCap, opts.Filter)
-		if err != nil {
-			closeResponseBody(resp)
-			return fmt.Errorf("write local response: %w", err)
-		}
-		logExchange(logger, req, resp, reqBytes, respBytes)
-		if opts.DumpDir != "" {
-			data, trunc, skipped := respCap.dumpPayload()
-			emitDump(opts.DumpDir, "resp", xid, req, resp, data, trunc, skipped, logger)
+		if stripHTTP3Advertising(resp.Header) {
+			AltSvcStripped.Inc()
 		}
 
-		closeConn := req.Close || resp.Close
+		if exchangeOpts.HTTP3Enabled {
+			resp.Header.Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=86400`, exchangeOpts.HTTP3Port))
+		}
+
+		if exchangeOpts.Policy != nil {
+			if decision := exchangeOpts.Policy.EvaluateResponse(resp, "https"); decision.Blocked {
+				closeResponseBody(resp)
+				RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+				logExchangeBlocked(logger, req, decision, exchangeOpts)
+				if !exchangeOpts.DumpOnPolicyHit || decision.Blocked {
+					safeReqDump("blocked")
+				}
+				if err := setWriteDeadline(localConn, exchangeOpts.IOTimeout); err != nil {
+					return fmt.Errorf("deadline local policy response block write: %w", err)
+				}
+				_, _ = io.WriteString(localConn, policyBlockResponse())
+				return nil
+			}
+		}
+		respCap := newBodyCapture(resp.Body != nil, exchangeOpts)
+		if err := setWriteDeadline(localConn, exchangeOpts.IOTimeout); err != nil {
+			closeResponseBody(resp)
+			if !exchangeOpts.DumpOnPolicyHit {
+				safeReqDump("allowed")
+			}
+			return fmt.Errorf("deadline local write: %w", err)
+		}
+		resp.Body = readCloserWithIdleDeadline(resp.Body, connReadDeadlineRefresher(upstreamConn, exchangeOpts.IOTimeout))
+		localWriter := writerWithIdleDeadline(localConn, connWriteDeadlineRefresher(localConn, exchangeOpts.IOTimeout))
+		respBytes, respDec, err := writeResponseStreaming(localWriter, resp, respCap, exchangeOpts.Filter)
+
+		policyHit := isPolicyHit(req, resp, reqDec, respDec, exchangeOpts.Policy)
+
+		if err != nil {
+			closeResponseBody(resp)
+			if respDec.Blocked {
+				RuleHits.WithLabelValues("default", respDec.MatchType, "block").Inc()
+				logExchangeBlocked(logger, req, respDec, exchangeOpts)
+			}
+			if !exchangeOpts.DumpOnPolicyHit || policyHit {
+				action := determineAction(req, resp, reqDec, respDec, exchangeOpts.Policy)
+				safeReqDump(action)
+				if exchangeOpts.DumpDir != "" {
+					data, trunc, skipped := respCap.dumpPayload()
+					emitDump(exchangeOpts, "resp", xid, req, resp, data, trunc, skipped, action, logger)
+				}
+			}
+			if isBenignRelayError(err, respBytes, resp.ContentLength, resp) {
+				return benignError{err: fmt.Errorf("write local response: %w", err)}
+			}
+			return fmt.Errorf("write local response: %w", err)
+		}
+		if respDec.Blocked {
+			RuleHits.WithLabelValues("default", respDec.MatchType, "block").Inc()
+			logExchangeBlocked(logger, req, respDec, exchangeOpts)
+		} else {
+			logExchange(logger, req, resp, reqBytes, respBytes, exchangeOpts)
+		}
+		if !exchangeOpts.DumpOnPolicyHit || policyHit {
+			action := determineAction(req, resp, reqDec, respDec, exchangeOpts.Policy)
+			safeReqDump(action)
+			if exchangeOpts.DumpDir != "" {
+				data, trunc, skipped := respCap.dumpPayload()
+				emitDump(exchangeOpts, "resp", xid, req, resp, data, trunc, skipped, action, logger)
+			}
+		}
+
+		exchanges++
+		upstreamReusable := !resp.Close && upstreamReader != nil && upstreamReader.Buffered() == 0
+		closeConn := localClose || resp.Close
 		closeResponseBody(resp)
 		if closeConn {
+			releaseCurrent(upstreamReusable)
 			return nil
 		}
 	}
+}
+
+func policyBlockResponse() string {
+	const body = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Access denied - LucidGate</title></head><body><h1>Access denied</h1><p>LucidGate blocked this request by URL policy.</p></body></html>`
+	return fmt.Sprintf("HTTP/1.1 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+}
+
+func isPolicyHit(req *http.Request, resp *http.Response, reqDec, respDec PolicyDecision, policy *Policy) bool {
+	if reqDec.Blocked || respDec.Blocked {
+		return true
+	}
+	if req == nil {
+		return false
+	}
+	if policy != nil {
+		host := req.Host
+		if host == "" && req.URL != nil {
+			host = req.URL.Host
+		}
+		if req.URL != nil && req.URL.Hostname() != "" {
+			host = req.URL.Hostname()
+		}
+		scheme := "http"
+		if req.TLS != nil {
+			scheme = "https"
+		}
+		shouldLog, suppressed, _, _, _ := policy.EvaluateLogging(host, req, scheme)
+		if suppressed {
+			// Suppressed by exceptionlog* lists: skip dump
+			return false
+		}
+		if shouldLog {
+			return true
+		}
+	}
+	if pm, ok := req.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch); ok {
+		if pm.Suppressed {
+			// Suppressed by exceptionlogphraselist: skip dump
+			return false
+		}
+		if pm.Matched {
+			return true
+		}
+	}
+	if resp != nil && resp.Request != nil {
+		if pm, ok := resp.Request.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch); ok {
+			if pm.Suppressed {
+				return false
+			}
+			if pm.Matched {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func determineAction(req *http.Request, resp *http.Response, reqDec, respDec PolicyDecision, policy *Policy) string {
+	if reqDec.Blocked || respDec.Blocked {
+		return "blocked"
+	}
+	if isPolicyHit(req, resp, reqDec, respDec, policy) {
+		return "audited"
+	}
+	return "allowed"
 }
 
 func setReadDeadline(conn net.Conn, timeout time.Duration) error {
@@ -155,7 +595,142 @@ func setWriteDeadline(conn net.Conn, timeout time.Duration) error {
 	return conn.SetWriteDeadline(time.Now().Add(timeout))
 }
 
+type readDeadliner interface {
+	SetReadDeadline(time.Time) error
+}
+
+type writeDeadliner interface {
+	SetWriteDeadline(time.Time) error
+}
+
+type deadlineRefresher func() error
+
+type idleDeadlineReader struct {
+	r       io.Reader
+	refresh deadlineRefresher
+}
+
+func (r idleDeadlineReader) Read(p []byte) (int, error) {
+	var deadlineErr error
+	if r.refresh != nil {
+		deadlineErr = r.refresh()
+		if deadlineErr != nil && !canReadPastDeadlineRefreshError(deadlineErr) {
+			return 0, deadlineErr
+		}
+	}
+	n, err := r.r.Read(p)
+	if err == nil && n == 0 && deadlineErr != nil {
+		return 0, deadlineErr
+	}
+	return n, err
+}
+
+type idleDeadlineReadCloser struct {
+	io.ReadCloser
+	refresh deadlineRefresher
+}
+
+func (r idleDeadlineReadCloser) Read(p []byte) (int, error) {
+	var deadlineErr error
+	if r.refresh != nil {
+		deadlineErr = r.refresh()
+		if deadlineErr != nil && !canReadPastDeadlineRefreshError(deadlineErr) {
+			return 0, deadlineErr
+		}
+	}
+	n, err := r.ReadCloser.Read(p)
+	if err == nil && n == 0 && deadlineErr != nil {
+		return 0, deadlineErr
+	}
+	return n, err
+}
+
+type idleDeadlineWriter struct {
+	w       io.Writer
+	refresh deadlineRefresher
+}
+
+func (w idleDeadlineWriter) Write(p []byte) (int, error) {
+	if w.refresh != nil {
+		if err := w.refresh(); err != nil {
+			return 0, err
+		}
+	}
+	return w.w.Write(p)
+}
+
+type idleDeadlineResponseWriter struct {
+	http.ResponseWriter
+	refresh deadlineRefresher
+}
+
+func (w idleDeadlineResponseWriter) Write(p []byte) (int, error) {
+	if w.refresh != nil {
+		if err := w.refresh(); err != nil {
+			return 0, err
+		}
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func readCloserWithIdleDeadline(r io.ReadCloser, refresh deadlineRefresher) io.ReadCloser {
+	if r == nil || refresh == nil {
+		return r
+	}
+	return idleDeadlineReadCloser{ReadCloser: r, refresh: refresh}
+}
+
+func readerWithIdleDeadline(r io.Reader, refresh deadlineRefresher) io.Reader {
+	if r == nil || refresh == nil {
+		return r
+	}
+	return idleDeadlineReader{r: r, refresh: refresh}
+}
+
+func writerWithIdleDeadline(w io.Writer, refresh deadlineRefresher) io.Writer {
+	if w == nil || refresh == nil {
+		return w
+	}
+	return idleDeadlineWriter{w: w, refresh: refresh}
+}
+
+func responseWriterWithIdleDeadline(w http.ResponseWriter, refresh deadlineRefresher) http.ResponseWriter {
+	if w == nil || refresh == nil {
+		return w
+	}
+	return idleDeadlineResponseWriter{ResponseWriter: w, refresh: refresh}
+}
+
+func connReadDeadlineRefresher(conn readDeadliner, timeout time.Duration) deadlineRefresher {
+	if conn == nil || timeout <= 0 {
+		return nil
+	}
+	return func() error {
+		return conn.SetReadDeadline(time.Now().Add(timeout))
+	}
+}
+
+func connWriteDeadlineRefresher(conn writeDeadliner, timeout time.Duration) deadlineRefresher {
+	if conn == nil || timeout <= 0 {
+		return nil
+	}
+	return func() error {
+		return conn.SetWriteDeadline(time.Now().Add(timeout))
+	}
+}
+
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func canReadPastDeadlineRefreshError(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, net.ErrClosed)
+}
+
 func SanitizeHeaders(req *http.Request) {
+	req.Header.Del("Connection")
+	req.Header.Del("Keep-Alive")
 	req.Header.Del("Proxy-Connection")
 	req.Header.Del("X-Forwarded-For")
 	req.Header.Del("Via")
@@ -193,7 +768,7 @@ type teeBuffer struct {
 	full  bool
 }
 
-func (t *teeBuffer) Write(p[]byte) (int, error) {
+func (t *teeBuffer) Write(p []byte) (int, error) {
 	if t.full {
 		return len(p), nil
 	}
@@ -262,25 +837,64 @@ func (c *bodyCapture) dumpPayload() ([]byte, bool, string) {
 	return c.tee.buf.Bytes(), c.tee.full, ""
 }
 
-func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, filter FilterEngine) (int64, error) {
+func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, filter FilterEngine) (int64, PolicyDecision, error) {
+	var dec PolicyDecision
 	if req.Body == nil {
 		if err := req.Write(w); err != nil {
-			return 0, err
+			return 0, dec, err
 		}
-		return 0, nil
+		return 0, dec, nil
 	}
 	body := io.Reader(req.Body)
 	var inspect *InspectReader
+	var activeFilter FilterEngine
 	if shouldInspectRequest(req) {
-		inspect = newInspectReader(req.Body, reqFilter(filter))
+		activeFilter = reqFilter(filter)
+		inspect = newInspectReader(req.Body, activeFilter)
 		defer inspect.Close()
 		body = inspect
 	}
 	if err := writeRequestHeader(w, req); err != nil {
-		return 0, err
+		return 0, dec, err
 	}
-	n, err := writeBodyStreaming(w, body, requestUsesChunked(req), req.Trailer, cap)
-	return cap.logBytes(n), err
+	n, err := writeBodyStreaming(w, body, requestUsesChunked(req), req.ContentLength, req.Trailer, cap)
+
+	if err != nil && errors.Is(err, ErrAntivirusBlocked) {
+		val := "antivirus signature"
+		errMsg := err.Error()
+		prefix := "antivirus blocked response: "
+		if strings.HasPrefix(errMsg, prefix) {
+			val = errMsg[len(prefix):]
+		}
+		dec = PolicyDecision{
+			Blocked:   true,
+			MatchType: "antivirus",
+			Value:     val,
+		}
+	} else if activeFilter != nil {
+		if decEngine, ok := activeFilter.(Decisioner); ok {
+			if blocked, matchType, val := decEngine.Decision(); blocked {
+				dec = PolicyDecision{
+					Blocked:   true,
+					MatchType: matchType,
+					Value:     val,
+				}
+			}
+		}
+		if ld, ok := activeFilter.(LogDecisioner); ok {
+			if matched, suppressed, matchType, val := ld.LogDecision(); matched || suppressed {
+				ctx := context.WithValue(req.Context(), LogPhraseCtxKey{}, LogPhraseMatch{
+					Matched:    matched,
+					Suppressed: suppressed,
+					MatchType:  matchType,
+					Value:      val,
+				})
+				*req = *req.WithContext(ctx)
+			}
+		}
+	}
+
+	return cap.logBytes(n), dec, err
 }
 
 func reqFilter(engine FilterEngine) FilterEngine {
@@ -299,27 +913,31 @@ func reqFilter(engine FilterEngine) FilterEngine {
 	return passThroughFilter{}
 }
 
-func writeResponseStreaming(w io.Writer, resp *http.Response, cap *bodyCapture, filter FilterEngine) (int64, error) {
+func writeResponseStreaming(w io.Writer, resp *http.Response, cap *bodyCapture, filter FilterEngine) (int64, PolicyDecision, error) {
+	var dec PolicyDecision
 	if resp.Body == nil {
 		if err := resp.Write(w); err != nil {
-			return 0, err
+			return 0, dec, err
 		}
-		return 0, nil
+		return 0, dec, nil
 	}
 	body := io.Reader(resp.Body)
+	originalContentLength := resp.ContentLength
 	var transformed io.ReadCloser
 	inspectResponse := shouldInspectResponse(resp, filter)
 	antivirus := antivirusForResponse(resp, filter)
+	var activeFilter FilterEngine
 	if inspectResponse {
-		inspected, err := newResponseInspectReader(resp.Body, resp.Header.Get("Content-Encoding"), respFilter(filter, resp.Header.Get("Content-Type"), resp.Request))
+		inspected, active, err := newResponseInspectReader(resp.Body, resp.Header.Get("Content-Encoding"), respFilter(filter, resp.Header.Get("Content-Type"), resp.Request))
 		if err != nil {
-			return 0, err
+			return 0, dec, err
 		}
+		activeFilter = active
 		transformed = inspected
 		defer transformed.Close()
 		body = inspected
 		resp.ContentLength = -1
-		resp.TransferEncoding =[]string{"chunked"}
+		resp.TransferEncoding = []string{"chunked"}
 		resp.Header.Del("Content-Length")
 	}
 	if antivirus != nil {
@@ -331,37 +949,78 @@ func writeResponseStreaming(w io.Writer, resp *http.Response, cap *bodyCapture, 
 		defer transformed.Close()
 		body = transformed
 		resp.ContentLength = -1
-		resp.TransferEncoding =[]string{"chunked"}
+		resp.TransferEncoding = []string{"chunked"}
 		resp.Header.Del("Content-Length")
 	}
 	if err := writeResponseHeader(w, resp); err != nil {
-		return 0, err
+		return 0, dec, err
 	}
-	n, err := writeBodyStreaming(w, body, responseUsesChunked(resp), resp.Trailer, cap)
-	return cap.logBytes(n), err
+	n, err := writeBodyStreaming(w, body, responseUsesChunked(resp), originalContentLength, resp.Trailer, cap)
+
+	if err != nil && errors.Is(err, ErrAntivirusBlocked) {
+		val := "antivirus signature"
+		errMsg := err.Error()
+		prefix := "antivirus blocked response: "
+		if strings.HasPrefix(errMsg, prefix) {
+			val = errMsg[len(prefix):]
+		}
+		dec = PolicyDecision{
+			Blocked:   true,
+			MatchType: "antivirus",
+			Value:     val,
+		}
+	} else if activeFilter != nil {
+		if decEngine, ok := activeFilter.(Decisioner); ok {
+			if blocked, matchType, val := decEngine.Decision(); blocked {
+				dec = PolicyDecision{
+					Blocked:   true,
+					MatchType: matchType,
+					Value:     val,
+				}
+			}
+		}
+		if ld, ok := activeFilter.(LogDecisioner); ok {
+			if matched, suppressed, matchType, val := ld.LogDecision(); matched || suppressed {
+				if resp.Request != nil {
+					ctx := context.WithValue(resp.Request.Context(), LogPhraseCtxKey{}, LogPhraseMatch{
+						Matched:    matched,
+						Suppressed: suppressed,
+						MatchType:  matchType,
+						Value:      val,
+					})
+					*resp.Request = *resp.Request.WithContext(ctx)
+				}
+			}
+		}
+	}
+
+	return cap.logBytes(n), dec, err
 }
 
-func writeResponseStreamingHTTP(w http.ResponseWriter, resp *http.Response, cap *bodyCapture, filter FilterEngine) (int64, error) {
+func writeResponseStreamingHTTP(w http.ResponseWriter, resp *http.Response, cap *bodyCapture, filter FilterEngine) (int64, PolicyDecision, error) {
+	var dec PolicyDecision
 	if resp.Body == nil {
 		copyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		return 0, nil
+		return 0, dec, nil
 	}
 	body := io.Reader(resp.Body)
 	var transformed io.ReadCloser
 	inspectResponse := shouldInspectResponse(resp, filter)
 	antivirus := antivirusForResponse(resp, filter)
 	forceChunked := inspectResponse || antivirus != nil
+	var activeFilter FilterEngine
 	if inspectResponse {
-		inspected, err := newResponseInspectReader(resp.Body, resp.Header.Get("Content-Encoding"), respFilter(filter, resp.Header.Get("Content-Type"), resp.Request))
+		inspected, active, err := newResponseInspectReader(resp.Body, resp.Header.Get("Content-Encoding"), respFilter(filter, resp.Header.Get("Content-Type"), resp.Request))
 		if err != nil {
-			return 0, err
+			return 0, dec, err
 		}
+		activeFilter = active
 		transformed = inspected
 		defer transformed.Close()
 		body = inspected
 		resp.ContentLength = -1
-		resp.TransferEncoding =[]string{"chunked"}
+		resp.TransferEncoding = []string{"chunked"}
 		resp.Header.Del("Content-Length")
 	}
 	if antivirus != nil {
@@ -373,7 +1032,7 @@ func writeResponseStreamingHTTP(w http.ResponseWriter, resp *http.Response, cap 
 		defer transformed.Close()
 		body = transformed
 		resp.ContentLength = -1
-		resp.TransferEncoding =[]string{"chunked"}
+		resp.TransferEncoding = []string{"chunked"}
 		resp.Header.Del("Content-Length")
 	}
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -384,7 +1043,45 @@ func writeResponseStreamingHTTP(w http.ResponseWriter, resp *http.Response, cap 
 	}
 	w.WriteHeader(resp.StatusCode)
 	n, err := copyBufferPooled(w, cap.reader(body))
-	return cap.logBytes(n), err
+
+	if err != nil && errors.Is(err, ErrAntivirusBlocked) {
+		val := "antivirus signature"
+		errMsg := err.Error()
+		prefix := "antivirus blocked response: "
+		if strings.HasPrefix(errMsg, prefix) {
+			val = errMsg[len(prefix):]
+		}
+		dec = PolicyDecision{
+			Blocked:   true,
+			MatchType: "antivirus",
+			Value:     val,
+		}
+	} else if activeFilter != nil {
+		if decEngine, ok := activeFilter.(Decisioner); ok {
+			if blocked, matchType, val := decEngine.Decision(); blocked {
+				dec = PolicyDecision{
+					Blocked:   true,
+					MatchType: matchType,
+					Value:     val,
+				}
+			}
+		}
+		if ld, ok := activeFilter.(LogDecisioner); ok {
+			if matched, suppressed, matchType, val := ld.LogDecision(); matched || suppressed {
+				if resp.Request != nil {
+					ctx := context.WithValue(resp.Request.Context(), LogPhraseCtxKey{}, LogPhraseMatch{
+						Matched:    matched,
+						Suppressed: suppressed,
+						MatchType:  matchType,
+						Value:      val,
+					})
+					*resp.Request = *resp.Request.WithContext(ctx)
+				}
+			}
+		}
+	}
+
+	return cap.logBytes(n), dec, err
 }
 
 func copyResponseHeaders(dst, src http.Header) {
@@ -447,7 +1144,7 @@ func respFilter(engine FilterEngine, contentType string, req *http.Request) Filt
 		}
 		return engine
 	}
-	var filters[]FilterEngine
+	var filters []FilterEngine
 	if content.Magic != nil && len(content.Magic.blocked) > 0 {
 		filters = append(filters, content.Magic.NewFilter())
 	}
@@ -455,6 +1152,13 @@ func respFilter(engine FilterEngine, contentType string, req *http.Request) Filt
 		if isHTMLContentType(contentType) {
 			if content.Semantic != nil {
 				filters = append(filters, newHTMLTextFilter(content.Semantic.NewFilter()))
+			}
+			if content.LogSemantic != nil {
+				lf := content.LogSemantic.NewFilter()
+				if psf, ok := lf.(*phraseStreamFilter); ok {
+					psf.observeOnly = true
+				}
+				filters = append(filters, newHTMLTextFilter(lf))
 			}
 			if content.Substitution != nil && content.Substitution.HasRules() {
 				// htmlTextFilter es solo "observador" (descarta la salida del inner)
@@ -469,6 +1173,13 @@ func respFilter(engine FilterEngine, contentType string, req *http.Request) Filt
 			if content.Semantic != nil {
 				filters = append(filters, content.Semantic.NewFilter())
 			}
+			if content.LogSemantic != nil {
+				lf := content.LogSemantic.NewFilter()
+				if psf, ok := lf.(*phraseStreamFilter); ok {
+					psf.observeOnly = true
+				}
+				filters = append(filters, lf)
+			}
 			if content.Masking != nil && content.Masking.maxLen > 0 {
 				filters = append(filters, content.Masking.NewFilter())
 			}
@@ -480,7 +1191,7 @@ func respFilter(engine FilterEngine, contentType string, req *http.Request) Filt
 	return newChainOrPassThrough(filters)
 }
 
-func newChainOrPassThrough(filters[]FilterEngine) FilterEngine {
+func newChainOrPassThrough(filters []FilterEngine) FilterEngine {
 	switch len(filters) {
 	case 0:
 		return passThroughFilter{}
@@ -496,19 +1207,23 @@ func isSemanticPhraseFilter(engine FilterEngine) bool {
 	return ok
 }
 
-func newResponseInspectReader(src io.ReadCloser, encoding string, engine FilterEngine) (io.ReadCloser, error) {
+func newResponseInspectReader(src io.ReadCloser, encoding string, engine FilterEngine) (io.ReadCloser, FilterEngine, error) {
 	encoding = normalizeContentEncoding(encoding)
 	if encoding == "" || encoding == "identity" {
-		return newInspectReader(src, engine), nil
+		return newInspectReader(src, engine), engine, nil
 	}
-	return newEncodedInspectReader(src, encoding, engine)
+	r, err := newEncodedInspectReader(src, encoding, engine)
+	if err != nil {
+		return nil, nil, err
+	}
+	return r, engine, nil
 }
 
 type InspectReader struct {
 	src     io.Reader
 	engine  FilterEngine
 	scratch *[]byte
-	out[]byte
+	out     []byte
 	blocked bool
 	flushed bool
 }
@@ -522,14 +1237,16 @@ func newInspectReader(src io.Reader, engine FilterEngine) *InspectReader {
 	}
 }
 
-func (r *InspectReader) Read(p[]byte) (int, error) {
+func (r *InspectReader) Read(p []byte) (int, error) {
 	for len(r.out) == 0 {
 		if r.blocked {
 			return 0, io.EOF
 		}
 		n, err := r.src.Read(*r.scratch)
 		if n > 0 {
+			start := time.Now()
 			out, blocked, filterErr := r.engine.ProcessChunk((*r.scratch)[:n])
+			InspectionDuration.Observe(time.Since(start).Seconds())
 			r.blocked = blocked
 			if filterErr != nil {
 				return 0, filterErr
@@ -628,7 +1345,7 @@ func (r *encodedInspectReader) run(pw *io.PipeWriter, src io.Reader, encoding st
 	_ = pw.Close()
 }
 
-func (r *encodedInspectReader) Read(p[]byte) (int, error) {
+func (r *encodedInspectReader) Read(p []byte) (int, error) {
 	return r.pr.Read(p)
 }
 
@@ -666,7 +1383,13 @@ func newContentDecoder(src io.Reader, encoding string) (io.ReadCloser, error) {
 	case "deflate":
 		return flate.NewReader(src), nil
 	case "br":
-		return readCloser{Reader: brotli.NewReader(src)}, nil
+		return newBrotliReader(src), nil
+	case "zstd":
+		r, err := zstd.NewReader(src)
+		if err != nil {
+			return nil, fmt.Errorf("zstd decoder: %w", err)
+		}
+		return readCloser{Reader: r, close: func() error { r.Close(); return nil }}, nil
 	default:
 		return nil, fmt.Errorf("unsupported content encoding %q", encoding)
 	}
@@ -679,7 +1402,9 @@ func newContentEncoder(dst io.Writer, encoding string) (io.WriteCloser, error) {
 	case "deflate":
 		return flate.NewWriter(dst, flate.DefaultCompression)
 	case "br":
-		return brotli.NewWriter(dst), nil
+		return newBrotliWriter(dst), nil
+	case "zstd":
+		return zstd.NewWriter(dst)
 	default:
 		return nil, fmt.Errorf("unsupported content encoding %q", encoding)
 	}
@@ -746,14 +1471,14 @@ func writeMessageHeaders(w io.Writer, h http.Header, contentLength int64, chunke
 	return err
 }
 
-func writeBodyStreaming(w io.Writer, body io.Reader, chunked bool, trailers http.Header, cap *bodyCapture) (int64, error) {
+func writeBodyStreaming(w io.Writer, body io.Reader, chunked bool, sizeHint int64, trailers http.Header, cap *bodyCapture) (int64, error) {
 	dst := w
 	var chunkWriter io.WriteCloser
 	if chunked {
 		chunkWriter = httputil.NewChunkedWriter(w)
 		dst = chunkWriter
 	}
-	n, err := copyBufferPooled(dst, cap.reader(body))
+	n, err := copyBufferPooledSize(dst, cap.reader(body), sizeHint)
 	if closeErr := closeChunkedBody(w, chunkWriter, trailers); err == nil {
 		err = closeErr
 	}
@@ -880,7 +1605,7 @@ func isMutableRequestContentType(ct string) bool {
 
 func isSupportedInspectEncoding(encoding string) bool {
 	switch normalizeContentEncoding(encoding) {
-	case "", "identity", "gzip", "x-gzip", "deflate", "br":
+	case "", "identity", "gzip", "x-gzip", "deflate", "br", "zstd":
 		return true
 	default:
 		return false
@@ -896,6 +1621,9 @@ func isMutableContentType(ct string) bool {
 		return false
 	}
 	mt := strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	if isStructuredStreamContentType(mt) {
+		return false
+	}
 	if strings.HasPrefix(mt, "text/") {
 		return true
 	}
@@ -912,6 +1640,15 @@ func isMutableContentType(ct string) bool {
 		return true
 	}
 	return false
+}
+
+func isStructuredStreamContentType(mt string) bool {
+	switch mt {
+	case "text/event-stream":
+		return true
+	default:
+		return false
+	}
 }
 
 func isFilterMutableResponseType(ct string) bool {
@@ -946,7 +1683,7 @@ func isHTMLContentType(ct string) bool {
 	}
 }
 
-func hasChunked(values[]string) bool {
+func hasChunked(values []string) bool {
 	for _, value := range values {
 		if strings.EqualFold(value, "chunked") {
 			return true
@@ -956,13 +1693,27 @@ func hasChunked(values[]string) bool {
 }
 
 func copyBufferPooled(dst io.Writer, src io.Reader) (int64, error) {
-	bufp := relayBufferPool.Get().(*[]byte)
-	defer relayBufferPool.Put(bufp)
+	return copyBufferPooledSize(dst, src, 32*1024)
+}
+
+func copyBufferPooledSize(dst io.Writer, src io.Reader, sizeHint int64) (int64, error) {
+	var pool *sync.Pool
+	if sizeHint > 0 && sizeHint <= 4096 {
+		pool = &pool4K
+	} else if sizeHint > 4096 && sizeHint <= 32*1024 {
+		pool = &pool32K
+	} else if sizeHint > 32*1024 {
+		pool = &pool64K
+	} else {
+		pool = &pool32K
+	}
+	bufp := pool.Get().(*[]byte)
+	defer pool.Put(bufp)
 	return io.CopyBuffer(dst, src, *bufp)
 }
 
-func logExchange(logger *slog.Logger, req *http.Request, resp *http.Response, reqBytes int64, respBytes int64) {
-	if logger == nil {
+func logExchange(logger *slog.Logger, req *http.Request, resp *http.Response, reqBytes int64, respBytes int64, opts RelayOptions) {
+	if logger == nil || req == nil {
 		return
 	}
 	path := ""
@@ -972,70 +1723,272 @@ func logExchange(logger *slog.Logger, req *http.Request, resp *http.Response, re
 	if path == "" {
 		path = "/"
 	}
-	logger.Info("exchange",
+
+	// Track transferred bytes metrics safely (Prometheus counters must be strictly monotonic, never add negative values)
+	if reqBytes > 0 {
+		BytesTransferred.WithLabelValues("in").Add(float64(reqBytes))
+	}
+	if respBytes > 0 {
+		BytesTransferred.WithLabelValues("out").Add(float64(respBytes))
+	}
+
+	var policyLog bool
+	var matchType, listName, matchVal string
+
+	if opts.Policy != nil {
+		host := req.Host
+		if host == "" && req.URL != nil {
+			host = req.URL.Host
+		}
+		var suppressed bool
+		policyLog, suppressed, matchType, listName, matchVal = opts.Policy.EvaluateLogging(host, req, "https")
+		if suppressed {
+			// Suppressed by exceptionlog* lists: skip exchange log completely
+			return
+		}
+	}
+
+	if pm, ok := req.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch); ok {
+		if pm.Suppressed {
+			// Suppressed by exceptionlogphraselist: skip exchange log completely
+			return
+		}
+		if pm.Matched && !policyLog {
+			policyLog = true
+			matchType = pm.MatchType
+			listName = "logphraselist"
+			matchVal = pm.Value
+		}
+	}
+
+	attrs := []slog.Attr{
 		slog.String("method", req.Method),
 		slog.String("host", req.Host),
 		slog.String("path", path),
-		slog.Int("status", resp.StatusCode),
 		slog.Int64("req_bytes", reqBytes),
-		slog.Int64("resp_bytes", respBytes),
+	}
+	if resp != nil {
+		attrs = append(attrs, slog.Int("status", resp.StatusCode))
+		attrs = append(attrs, slog.Int64("resp_bytes", respBytes))
+	}
+	if policyLog {
+		attrs = append(attrs, slog.Bool("policy_log", true))
+		attrs = append(attrs, slog.String("policy_match_type", matchType))
+		attrs = append(attrs, slog.String("policy_list", listName))
+		attrs = append(attrs, slog.String("policy_value", matchVal))
+
+		// Record rule hit metric
+		RuleHits.WithLabelValues("default", listName, "log").Inc()
+	}
+
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+}
+
+func logExchangeBlocked(logger *slog.Logger, req *http.Request, decision PolicyDecision, opts RelayOptions) {
+	if logger == nil || req == nil {
+		return
+	}
+	path := ""
+	if req.URL != nil {
+		path = req.URL.RequestURI()
+	}
+	if path == "" {
+		path = "/"
+	}
+
+	logger.LogAttrs(context.Background(), slog.LevelInfo, "exchange",
+		slog.String("method", req.Method),
+		slog.String("host", req.Host),
+		slog.String("path", path),
+		slog.Int("status", http.StatusForbidden),
+		slog.Bool("policy_blocked", true),
+		slog.String("policy_match_type", decision.MatchType),
+		slog.String("policy_value", decision.Value),
+		slog.String("profile", "default"),
 	)
 }
 
 // ---------- Cleartext dumping (Phase 1: Blue-Team capture) ----------
 
 type dumpEntry struct {
-	Timestamp   string            `json:"ts"`
-	ExchangeID  string            `json:"xid"`
-	Direction   string            `json:"dir"` // "req" | "resp"
-	Method      string            `json:"method,omitempty"`
-	Host        string            `json:"host,omitempty"`
-	Path        string            `json:"path,omitempty"`
-	Status      int               `json:"status,omitempty"`
-	ContentType string            `json:"content_type,omitempty"`
-	Encoding    string            `json:"content_encoding,omitempty"`
-	Headers     map[string]string `json:"headers,omitempty"`
-	Body        string            `json:"body,omitempty"`
-	BodyB64     bool              `json:"body_b64,omitempty"`
-	BodyBytes   int               `json:"body_bytes"`
-	Truncated   bool              `json:"truncated,omitempty"`
-	Skipped     string            `json:"skipped,omitempty"`
+	Timestamp                    string            `json:"ts"`
+	ExchangeID                   string            `json:"xid"`
+	Direction                    string            `json:"dir"` // "req" | "resp"
+	Method                       string            `json:"method,omitempty"`
+	Host                         string            `json:"host,omitempty"`
+	Path                         string            `json:"path,omitempty"`
+	Status                       int               `json:"status,omitempty"`
+	ContentType                  string            `json:"content_type,omitempty"`
+	Encoding                     string            `json:"content_encoding,omitempty"`
+	Headers                      map[string]string `json:"headers,omitempty"`
+	Body                         string            `json:"body,omitempty"`
+	BodyB64                      bool              `json:"body_b64,omitempty"`
+	BodyBytes                    int               `json:"body_bytes"`
+	Truncated                    bool              `json:"truncated,omitempty"`
+	Skipped                      string            `json:"skipped,omitempty"`
+	ContainsCleartextCredentials bool              `json:"contains_cleartext_credentials,omitempty"`
+	ClientIP                     string            `json:"client_ip,omitempty"`
+	ClientDevice                 string            `json:"client_device,omitempty"`
+	User                         string            `json:"user,omitempty"`
+	PolicyAction                 string            `json:"policy_action,omitempty"`
+	PolicyList                   string            `json:"policy_list,omitempty"`
+	BodyHash                     string            `json:"body_hash,omitempty"`
+}
+
+type dumpTask struct {
+	line   []byte
+	opts   RelayOptions
+	logger *slog.Logger
+}
+
+type ForensicDumper struct {
+	opts     RelayOptions
+	dumpChan chan dumpTask
+	wg       sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+func newForensicDumper(opts RelayOptions) (*ForensicDumper, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	d := &ForensicDumper{
+		opts:     opts,
+		dumpChan: make(chan dumpTask, 4096),
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+	d.wg.Add(1)
+	go d.asyncDumpLoop()
+	return d, nil
+}
+
+func (d *ForensicDumper) Close() {
+	d.cancel()
+	d.wg.Wait()
 }
 
 var (
-	dumpInitOnce sync.Once
-	dumpFile     *os.File
-	dumpInitErr  error
-	dumpChan     chan[]byte
-	exchangeSeq  atomic.Uint64
+	globalDumper   atomic.Pointer[ForensicDumper]
+	globalDumperMu sync.Mutex
+	exchangeSeq    atomic.Uint64
 )
 
 func newExchangeID() string {
 	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), exchangeSeq.Add(1))
 }
 
-func initDumper(dir string) error {
-	dumpInitOnce.Do(func() {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			dumpInitErr = err
-			return
+func initDumper(opts RelayOptions) error {
+	if globalDumper.Load() != nil {
+		return nil
+	}
+
+	globalDumperMu.Lock()
+	defer globalDumperMu.Unlock()
+
+	if globalDumper.Load() != nil {
+		return nil
+	}
+
+	d, err := newForensicDumper(opts)
+	if err != nil {
+		return err
+	}
+	globalDumper.Store(d)
+	return nil
+}
+
+var (
+	jsonKeyRegex = regexp.MustCompile(`(?i)"(password|token|api_key|secret|client_secret)"\s*:\s*"[^"]*"`)
+	formKeyRegex = regexp.MustCompile(`(?i)(password|token|api_key|secret|client_secret)=[^&]*`)
+	jwtRegex     = regexp.MustCompile(`eyJ[a-zA-Z0-9_-]{2,}\.[a-zA-Z0-9_-]{2,}\.[a-zA-Z0-9_-]{2,}`)
+)
+
+func hmacString(key, val string) string {
+	if key == "" {
+		return "[REDACTED]"
+	}
+	h := hmac.New(sha256.New, []byte(key))
+	h.Write([]byte(val))
+	return "[REDACTED:HMAC-" + hex.EncodeToString(h.Sum(nil)) + "]"
+}
+
+func redactHeaders(h map[string]string, auditKey string, dumpCleartext bool) map[string]string {
+	if h == nil {
+		return nil
+	}
+	if dumpCleartext {
+		return h
+	}
+	out := make(map[string]string, len(h))
+	for k, v := range h {
+		kl := strings.ToLower(k)
+		if kl == "authorization" || kl == "cookie" || kl == "set-cookie" || kl == "proxy-authorization" {
+			out[k] = hmacString(auditKey, v)
+		} else {
+			out[k] = v
 		}
-		path := filepath.Join(dir, fmt.Sprintf("dump_%d.jsonl", time.Now().Unix()))
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-		if err != nil {
-			dumpInitErr = err
-			return
-		}
-		dumpFile = f
-		dumpChan = make(chan[]byte, 4096)
-		go asyncDumpLoop()
+	}
+	return out
+}
+
+func redactBody(body string, contentType string, auditKey string, dumpCleartext bool) string {
+	if body == "" {
+		return ""
+	}
+	if dumpCleartext {
+		return body
+	}
+	mt := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+
+	// Redact JWTs everywhere
+	body = jwtRegex.ReplaceAllStringFunc(body, func(match string) string {
+		return hmacString(auditKey, match)
 	})
-	return dumpInitErr
+
+	if strings.Contains(mt, "json") {
+		body = jsonKeyRegex.ReplaceAllStringFunc(body, func(match string) string {
+			parts := strings.SplitN(match, ":", 2)
+			if len(parts) == 2 {
+				val := strings.Trim(parts[1], ` "`)
+				return parts[0] + `: "` + hmacString(auditKey, val) + `"`
+			}
+			return match
+		})
+	} else if mt == "application/x-www-form-urlencoded" {
+		body = formKeyRegex.ReplaceAllStringFunc(body, func(match string) string {
+			parts := strings.SplitN(match, "=", 2)
+			if len(parts) == 2 {
+				return parts[0] + "=" + hmacString(auditKey, parts[1])
+			}
+			return match
+		})
+	}
+
+	// General fallback: if it contains any sensitive keywords, redact them in plain text key=val/key:val patterns
+	body = regexp.MustCompile(`(?i)(password|token|api_key|secret|client_secret)([:=])\s*([^\s"&']+)`).ReplaceAllStringFunc(body, func(match string) string {
+		sep := ":"
+		if strings.Contains(match, "=") {
+			sep = "="
+		}
+		parts := strings.SplitN(match, sep, 2)
+		if len(parts) == 2 {
+			return parts[0] + sep + hmacString(auditKey, parts[1])
+		}
+		return match
+	})
+
+	return body
 }
 
 // emitDump writes one JSONL record describing a request or response. Failures
 // are logged but never propagate: an inspection sidecar must not break relay.
-func emitDump(dumpDir, direction, xid string, req *http.Request, resp *http.Response, raw[]byte, truncated bool, skipped string, logger *slog.Logger) {
+func emitDump(opts RelayOptions, direction, xid string, req *http.Request, resp *http.Response, raw []byte, truncated bool, skipped string, policyAction string, logger *slog.Logger) {
+	if isDiskSpaceLow(opts.DumpDir, opts.DumpMinFreeSpaceMB) {
+		if skipped == "" {
+			skipped = "low disk space warning"
+		}
+	}
+
 	entry := dumpEntry{
 		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
 		ExchangeID: xid,
@@ -1049,7 +2002,59 @@ func emitDump(dumpDir, direction, xid string, req *http.Request, resp *http.Resp
 		if req.URL != nil {
 			entry.Path = req.URL.RequestURI()
 		}
+
+		// Client IP
+		ip, _, err := net.SplitHostPort(req.RemoteAddr)
+		if err == nil {
+			entry.ClientIP = ip
+		} else {
+			entry.ClientIP = req.RemoteAddr
+		}
+
+		// Client Device (User-Agent)
+		entry.ClientDevice = req.Header.Get("User-Agent")
+
+		// Authenticated User
+		user := req.Header.Get("X-User")
+		if user == "" {
+			user = req.Header.Get("X-Forwarded-User")
+		}
+		if user == "" {
+			user = req.Header.Get("X-Auth-Username")
+		}
+		if user == "" {
+			if auth := req.Header.Get("Proxy-Authorization"); strings.HasPrefix(strings.ToLower(auth), "basic ") {
+				payload, err := base64.StdEncoding.DecodeString(auth[6:])
+				if err == nil {
+					pair := strings.SplitN(string(payload), ":", 2)
+					if len(pair) > 0 {
+						user = pair[0]
+					}
+				}
+			}
+		}
+		entry.User = user
 	}
+	entry.PolicyAction = policyAction
+	if opts.Policy != nil && req != nil {
+		host := req.Host
+		if req.URL != nil && req.URL.Hostname() != "" {
+			host = req.URL.Hostname()
+		}
+		scheme := "http"
+		if req.TLS != nil {
+			scheme = "https"
+		}
+		_, _, _, listName, _ := opts.Policy.EvaluateLogging(host, req, scheme)
+		entry.PolicyList = listName
+	}
+	if entry.PolicyList == "" && req != nil {
+		if pm, ok := req.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch); ok && pm.Matched {
+			entry.PolicyList = "logphraselist"
+		}
+	}
+	entry.ContainsCleartextCredentials = opts.DumpCredentialsCleartext
+
 	var headers http.Header
 	switch direction {
 	case "req":
@@ -1063,13 +2068,19 @@ func emitDump(dumpDir, direction, xid string, req *http.Request, resp *http.Resp
 		}
 	}
 	if headers != nil {
-		entry.Headers = flattenHeaders(headers)
+		entry.Headers = redactHeaders(flattenHeaders(headers), opts.AuditKey, opts.DumpCredentialsCleartext)
 		entry.ContentType = headers.Get("Content-Type")
 		entry.Encoding = headers.Get("Content-Encoding")
 	}
 
 	if len(raw) > 0 {
-		if !isTextualContentType(entry.ContentType) {
+		h := sha256.New()
+		h.Write(raw)
+		entry.BodyHash = hex.EncodeToString(h.Sum(nil))
+
+		if entry.Skipped != "" {
+			entry.BodyBytes = len(raw)
+		} else if !isTextualContentType(entry.ContentType) {
 			if entry.Skipped == "" {
 				entry.Skipped = "non-textual content-type"
 			}
@@ -1083,7 +2094,7 @@ func emitDump(dumpDir, direction, xid string, req *http.Request, resp *http.Resp
 				decoded = raw
 			}
 			if utf8.Valid(decoded) {
-				entry.Body = string(decoded)
+				entry.Body = redactBody(string(decoded), entry.ContentType, opts.AuditKey, opts.DumpCredentialsCleartext)
 			} else {
 				entry.Body = base64.StdEncoding.EncodeToString(decoded)
 				entry.BodyB64 = true
@@ -1092,11 +2103,11 @@ func emitDump(dumpDir, direction, xid string, req *http.Request, resp *http.Resp
 		}
 	}
 
-	writeDumpLine(dumpDir, &entry, logger)
+	writeDumpLine(opts, &entry, logger)
 }
 
-func writeDumpLine(dir string, entry *dumpEntry, logger *slog.Logger) {
-	if err := initDumper(dir); err != nil {
+func writeDumpLine(opts RelayOptions, entry *dumpEntry, logger *slog.Logger) {
+	if err := initDumper(opts); err != nil {
 		if logger != nil {
 			logger.Error("dump open failed", slog.Any("error", err))
 		}
@@ -1110,28 +2121,236 @@ func writeDumpLine(dir string, entry *dumpEntry, logger *slog.Logger) {
 		return
 	}
 	line = append(line, '\n')
-	select {
-	case dumpChan <- line:
-	default:
-		if logger != nil {
-			logger.Warn("dump channel full, dropping record", slog.String("xid", entry.ExchangeID))
+
+	d := globalDumper.Load()
+	if d != nil {
+		select {
+		case d.dumpChan <- dumpTask{line: line, opts: opts, logger: logger}:
+		default:
+			if logger != nil {
+				logger.Warn("dump channel full, dropping record", slog.String("xid", entry.ExchangeID))
+			}
 		}
 	}
 }
 
-func asyncDumpLoop() {
-	bw := bufio.NewWriterSize(dumpFile, 64*1024)
+func isDiskSpaceLow(dir string, thresholdMB int64) bool {
+	if thresholdMB <= 0 {
+		return false
+	}
+	checkDir := dir
+	for {
+		_, err := os.Stat(checkDir)
+		if err == nil {
+			break
+		}
+		parent := filepath.Dir(checkDir)
+		if parent == checkDir {
+			break
+		}
+		checkDir = parent
+	}
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(checkDir, &stat); err != nil {
+		return false
+	}
+	freeBytes := uint64(stat.Bavail) * uint64(stat.Bsize)
+	freeMB := int64(freeBytes / (1024 * 1024))
+	return freeMB < thresholdMB
+}
+
+func compressFileGzip(srcPath string) error {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	destPath := srcPath + ".gz"
+	dest, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	defer dest.Close()
+
+	gw := gzip.NewWriter(dest)
+	defer gw.Close()
+
+	_, err = io.Copy(gw, src)
+	return err
+}
+
+func sortStrings(slice []string) {
+	for i := 0; i < len(slice); i++ {
+		for j := i + 1; j < len(slice); j++ {
+			if slice[i] > slice[j] {
+				slice[i], slice[j] = slice[j], slice[i]
+			}
+		}
+	}
+}
+
+func (d *ForensicDumper) rotateDumpFiles(oldPath string, logger *slog.Logger) {
+	opts := d.opts
+	if oldPath == "" {
+		return
+	}
+
+	if opts.DumpCompress {
+		go func(path string) {
+			if err := compressFileGzip(path); err != nil {
+				if logger != nil {
+					logger.Error("dump file compression failed", slog.String("path", path), slog.Any("error", err))
+				}
+			} else {
+				_ = os.Remove(path)
+			}
+		}(oldPath)
+	}
+
+	if opts.DumpMaxBackups > 0 {
+		files, err := os.ReadDir(opts.DumpDir)
+		if err != nil {
+			return
+		}
+		var dumpFiles []string
+		for _, f := range files {
+			if f.IsDir() {
+				continue
+			}
+			name := f.Name()
+			if strings.HasPrefix(name, "dump_") && (strings.HasSuffix(name, ".jsonl") || strings.HasSuffix(name, ".jsonl.gz")) {
+				dumpFiles = append(dumpFiles, filepath.Join(opts.DumpDir, name))
+			}
+		}
+
+		sortStrings(dumpFiles)
+
+		if len(dumpFiles) > opts.DumpMaxBackups {
+			excess := len(dumpFiles) - opts.DumpMaxBackups
+			for i := 0; i < excess; i++ {
+				_ = os.Remove(dumpFiles[i])
+			}
+		}
+	}
+}
+
+func (d *ForensicDumper) asyncDumpLoop() {
+	defer d.wg.Done()
+
+	var dumpFile *os.File
+	var currentPath string
+	var bw *bufio.Writer
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
+	var lastWarnedTime time.Time
+
+	defer func() {
+		if bw != nil {
+			_ = bw.Flush()
+		}
+		if dumpFile != nil {
+			_ = dumpFile.Close()
+		}
+	}()
+
 	for {
 		select {
-		case line := <-dumpChan:
-			_, _ = bw.Write(line)
-			if bw.Available() < 4096 {
+		case <-d.ctx.Done():
+			// Drenar de forma no bloqueante todas las tareas pendientes del canal
+			for {
+				select {
+				case task := <-d.dumpChan:
+					d.processTask(&dumpFile, &currentPath, &bw, task, &lastWarnedTime)
+				default:
+					return
+				}
+			}
+
+		case task := <-d.dumpChan:
+			d.processTask(&dumpFile, &currentPath, &bw, task, &lastWarnedTime)
+
+		case <-ticker.C:
+			if bw != nil {
 				_ = bw.Flush()
 			}
-		case <-ticker.C:
-			_ = bw.Flush()
+		}
+	}
+}
+
+func (d *ForensicDumper) processTask(
+	dumpFile **os.File,
+	currentPath *string,
+	bw **bufio.Writer,
+	task dumpTask,
+	lastWarnedTime *time.Time,
+) {
+	opts := d.opts
+
+	// Check disk space threshold
+	if isDiskSpaceLow(opts.DumpDir, opts.DumpMinFreeSpaceMB) {
+		if time.Since(*lastWarnedTime) > 5*time.Second {
+			if task.logger != nil {
+				task.logger.Warn("forensic log dump skipped: low disk space on target partition",
+					slog.String("dir", opts.DumpDir),
+					slog.Int64("min_free_mb", opts.DumpMinFreeSpaceMB))
+			}
+			*lastWarnedTime = time.Now()
+		}
+		return
+	}
+
+	// Lazy initialization of active dump file
+	if *dumpFile == nil {
+		if err := os.MkdirAll(opts.DumpDir, 0o700); err != nil {
+			if task.logger != nil {
+				task.logger.Error("failed to create dump directory", slog.Any("error", err))
+			}
+			return
+		}
+		path := filepath.Join(opts.DumpDir, fmt.Sprintf("dump_%d.jsonl", time.Now().UnixNano()))
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			if task.logger != nil {
+				task.logger.Error("failed to lazily open dump file", slog.Any("error", err))
+			}
+			return
+		}
+		*dumpFile = f
+		*currentPath = path
+		*bw = bufio.NewWriterSize(*dumpFile, 64*1024)
+	} else {
+		// Check file size rotation
+		fi, err := (*dumpFile).Stat()
+		if err == nil && fi.Size() >= int64(opts.DumpMaxSizeMB)*1024*1024 {
+			if *bw != nil {
+				_ = (*bw).Flush()
+			}
+			_ = (*dumpFile).Close()
+
+			d.rotateDumpFiles(*currentPath, task.logger)
+
+			newPath := filepath.Join(opts.DumpDir, fmt.Sprintf("dump_%d.jsonl", time.Now().UnixNano()))
+			f, err := os.OpenFile(newPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+			if err == nil {
+				*dumpFile = f
+				*currentPath = newPath
+				*bw = bufio.NewWriterSize(*dumpFile, 64*1024)
+			} else {
+				*dumpFile = nil
+				*currentPath = ""
+				*bw = nil
+				if task.logger != nil {
+					task.logger.Error("failed to create new dump file after rotation", slog.Any("error", err))
+				}
+			}
+		}
+	}
+
+	if *dumpFile != nil && *bw != nil {
+		_, _ = (*bw).Write(task.line)
+		if (*bw).Available() < 4096 {
+			_ = (*bw).Flush()
 		}
 	}
 }
@@ -1194,7 +2413,16 @@ func decompressBody(data []byte, encoding string) ([]byte, error) {
 		defer r.Close()
 		return copyDecodedBody(r, "deflate")
 	case "br":
-		return copyDecodedBody(brotli.NewReader(bytes.NewReader(data)), "brotli")
+		r := newBrotliReader(bytes.NewReader(data))
+		defer r.Close()
+		return copyDecodedBody(r, "brotli")
+	case "zstd":
+		r, err := zstd.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("zstd: %w", err)
+		}
+		defer r.Close()
+		return copyDecodedBody(r, "zstd")
 	}
 	return nil, fmt.Errorf("unsupported encoding %q", encoding)
 }
@@ -1205,4 +2433,60 @@ func copyDecodedBody(r io.Reader, label string) ([]byte, error) {
 		return nil, fmt.Errorf("%s: %w", label, err)
 	}
 	return out.Bytes(), nil
+}
+
+type benignError struct {
+	err error
+}
+
+func (e benignError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return "benign connection closed"
+}
+
+func (e benignError) Unwrap() error {
+	return e.err
+}
+
+func (e benignError) Benign() bool {
+	return true
+}
+
+func isBenignRelayError(err error, bytesWritten int64, contentLength int64, resp *http.Response) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	isBrokenPipe := strings.Contains(errStr, "broken pipe") ||
+		strings.Contains(errStr, "connection reset by peer") ||
+		strings.Contains(errStr, "i/o timeout") ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET)
+
+	if !isBrokenPipe {
+		return false
+	}
+
+	if contentLength >= 0 && bytesWritten >= contentLength {
+		return true
+	}
+
+	if contentLength == 0 || resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusNotModified {
+		return true
+	}
+
+	return false
+}
+
+func isHostH2(h2Hosts *sync.Map, host string) bool {
+	if h2Hosts == nil {
+		return false
+	}
+	val, ok := h2Hosts.Load(host)
+	if !ok {
+		return false
+	}
+	return val.(bool)
 }

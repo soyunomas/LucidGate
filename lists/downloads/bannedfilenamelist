@@ -1,0 +1,3 @@
+# LucidGate blocked filenames.
+# Matches basename from URL path or Content-Disposition.
+secret.bin

@@ -103,6 +103,7 @@ func (f *maskingStreamFilter) Flush() ([]byte, error) {
 
 type ContentFilter struct {
 	Semantic     *PhraseFilter
+	LogSemantic  *PhraseFilter
 	Masking      *MaskingFilter
 	HTML         *HTMLInjectionFilter
 	Magic        *MagicFilter
@@ -118,6 +119,13 @@ func NewContentFilter(semantic *PhraseFilter, masking *MaskingFilter, html *HTML
 	return f
 }
 
+func (f *ContentFilter) WithLogSemantic(logSemantic *PhraseFilter) *ContentFilter {
+	if f != nil {
+		f.LogSemantic = logSemantic
+	}
+	return f
+}
+
 func (f *ContentFilter) NewFilter() FilterEngine {
 	var filters []FilterEngine
 	if f != nil && f.Magic != nil && len(f.Magic.blocked) > 0 {
@@ -125,6 +133,13 @@ func (f *ContentFilter) NewFilter() FilterEngine {
 	}
 	if f != nil && f.Semantic != nil {
 		filters = append(filters, f.Semantic.NewFilter())
+	}
+	if f != nil && f.LogSemantic != nil {
+		lf := f.LogSemantic.NewFilter()
+		if psf, ok := lf.(*phraseStreamFilter); ok {
+			psf.observeOnly = true
+		}
+		filters = append(filters, lf)
 	}
 	if f != nil && f.Masking != nil && f.Masking.maxLen > 0 {
 		filters = append(filters, f.Masking.NewFilter())
@@ -147,6 +162,28 @@ func (f *ContentFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
 
 type chainFilter struct {
 	filters []FilterEngine
+}
+
+func (f *chainFilter) Decision() (bool, string, string) {
+	for _, filter := range f.filters {
+		if dec, ok := filter.(Decisioner); ok {
+			if blocked, matchType, value := dec.Decision(); blocked {
+				return true, matchType, value
+			}
+		}
+	}
+	return false, "", ""
+}
+
+func (f *chainFilter) LogDecision() (bool, bool, string, string) {
+	for _, filter := range f.filters {
+		if ld, ok := filter.(LogDecisioner); ok {
+			if matched, suppressed, matchType, value := ld.LogDecision(); matched || suppressed {
+				return matched, suppressed, matchType, value
+			}
+		}
+	}
+	return false, false, "", ""
 }
 
 func (f *chainFilter) ProcessChunk(in []byte) ([]byte, bool, error) {

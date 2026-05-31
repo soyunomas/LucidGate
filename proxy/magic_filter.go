@@ -60,10 +60,18 @@ func (f *MagicFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
 }
 
 type magicStreamFilter struct {
-	compiled *MagicFilter
-	pending  []byte
-	decided  bool
-	blocked  bool
+	compiled    *MagicFilter
+	pending     []byte
+	decided     bool
+	blocked     bool
+	blockedMime string
+}
+
+func (f *magicStreamFilter) Decision() (bool, string, string) {
+	if f.blocked {
+		return true, "magic", f.blockedMime
+	}
+	return false, "", ""
 }
 
 func (f *magicStreamFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
@@ -104,6 +112,7 @@ func (f *magicStreamFilter) commitDecision(tail []byte) ([]byte, bool, error) {
 	mime := detectMagicType(f.pending)
 	if _, hit := f.compiled.blocked[mime]; hit {
 		f.blocked = true
+		f.blockedMime = mime
 		f.pending = nil
 		return nil, true, nil
 	}

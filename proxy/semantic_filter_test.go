@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -125,6 +126,93 @@ func TestPhraseFilterDoesNotBlockBelowScoreThreshold(t *testing.T) {
 	}
 }
 
+func TestPhraseFilterExceptionSuppressesHardBlock(t *testing.T) {
+	filter, err := NewPhraseFilterWithExceptions(
+		[]string{"malware kit"},
+		nil,
+		[]string{"malware research"},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewPhraseFilterWithExceptions() error = %v", err)
+	}
+	stream := filter.NewFilter()
+
+	// The exception fires before the hard match, so the stream is excepted
+	// and the malware-kit hit must be ignored.
+	out, blocked, err := stream.ProcessChunk([]byte("the article is about malware research and includes a malware kit example"))
+	if err != nil {
+		t.Fatalf("ProcessChunk() error = %v", err)
+	}
+	if blocked {
+		t.Fatalf("blocked = true with out=%q, want exception to suppress hard match", string(out))
+	}
+}
+
+func TestPhraseFilterExceptionAcrossChunkBoundary(t *testing.T) {
+	filter, err := NewPhraseFilterWithExceptions(
+		[]string{"credential dump"},
+		nil,
+		[]string{"security audit"},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewPhraseFilterWithExceptions() error = %v", err)
+	}
+	stream := filter.NewFilter()
+
+	if _, blocked, err := stream.ProcessChunk([]byte("a routine security au")); err != nil || blocked {
+		t.Fatalf("first chunk blocked=%t err=%v, want passthrough", blocked, err)
+	}
+	if _, blocked, err := stream.ProcessChunk([]byte("dit covered credential dump scenarios")); err != nil || blocked {
+		t.Fatalf("second chunk blocked=%t err=%v, want exception to span chunk", blocked, err)
+	}
+}
+
+func TestPhraseFilterExceptionAfterHardMatchStillBlocks(t *testing.T) {
+	filter, err := NewPhraseFilterWithExceptions(
+		[]string{"malware kit"},
+		nil,
+		[]string{"malware research"},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewPhraseFilterWithExceptions() error = %v", err)
+	}
+	stream := filter.NewFilter()
+
+	// Hard match comes BEFORE the exception in the byte stream; we cannot
+	// rewind already-sent bytes, so the block must fire as documented.
+	out, blocked, err := stream.ProcessChunk([]byte("first hit malware kit then context malware research"))
+	if err != nil {
+		t.Fatalf("ProcessChunk() error = %v", err)
+	}
+	if !blocked {
+		t.Fatalf("blocked = false out=%q, want hard match to block before exception fires", string(out))
+	}
+}
+
+func TestPhraseFilterExceptionSuppressesScoreThreshold(t *testing.T) {
+	filter, err := NewPhraseFilterWithExceptions(
+		nil,
+		[]WeightedPhrase{{Phrase: "malware", Weight: 60}, {Phrase: "exploit", Weight: 60}},
+		[]string{"academic paper"},
+		100,
+	)
+	if err != nil {
+		t.Fatalf("NewPhraseFilterWithExceptions() error = %v", err)
+	}
+	stream := filter.NewFilter()
+
+	out, blocked, err := stream.ProcessChunk([]byte("this academic paper analyzes malware and exploit techniques"))
+	if err != nil {
+		t.Fatalf("ProcessChunk() error = %v", err)
+	}
+	if blocked {
+		t.Fatalf("blocked = true out=%q, want exception to suppress score threshold", string(out))
+	}
+}
+
 func TestPhraseFilterRejectsInvalidScoringConfig(t *testing.T) {
 	_, err := NewScoredPhraseFilter(nil, []WeightedPhrase{{Phrase: "malware", Weight: 1}}, 0)
 	if err == nil {
@@ -196,7 +284,7 @@ func TestWriteResponseStreamingPhraseFilterStopsTextResponse(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	got, err := writeResponseStreaming(&out, resp, cap, filter)
+	got, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -217,7 +305,7 @@ func TestWriteResponseStreamingPhraseFilterAllowsCleanTextResponse(t *testing.T)
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	got, err := writeResponseStreaming(&out, resp, cap, filter)
+	got, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -241,7 +329,7 @@ func TestWriteResponseStreamingScoredPhraseFilterStopsTextResponse(t *testing.T)
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	got, err := writeResponseStreaming(&out, resp, cap, filter)
+	got, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -262,7 +350,7 @@ func TestWriteResponseStreamingHTMLFilterMatchesVisibleTextAcrossTags(t *testing
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err = writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err = writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -284,7 +372,7 @@ func TestWriteResponseStreamingHTMLFilterIgnoresAttributesCommentsAndScriptStyle
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err = writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err = writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -305,7 +393,7 @@ func TestWriteResponseStreamingPhraseFilterBypassesBinaryResponse(t *testing.T) 
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err = writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err = writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -321,7 +409,7 @@ func TestWriteResponseStreamingMasksTextResponse(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	got, err := writeResponseStreaming(&out, resp, cap, filter)
+	got, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -348,7 +436,7 @@ func TestWriteResponseStreamingDoesNotMaskHTMLResponse(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err := writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -363,7 +451,7 @@ func TestWriteResponseStreamingInjectsHTMLBannerBeforeBodyClose(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err := writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -406,7 +494,7 @@ func TestWriteResponseStreamingDoesNotInjectBannerIntoPlainText(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err := writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err := writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -426,7 +514,7 @@ func TestWriteResponseStreamingDoesNotInjectAfterSemanticBlock(t *testing.T) {
 	var out strings.Builder
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
 
-	_, err = writeResponseStreaming(&out, resp, cap, filter)
+	_, _, err = writeResponseStreaming(&out, resp, cap, filter)
 	if err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
@@ -483,5 +571,57 @@ func baseResponse(body string) *http.Response {
 		Header:        make(http.Header),
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
+	}
+}
+
+func TestPhraseFilterLogPhrases(t *testing.T) {
+	logFilter, err := NewPhraseFilterWithExceptions(
+		[]string{"log phrase"},
+		nil,
+		[]string{"except log phrase"},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("NewPhraseFilterWithExceptions() error = %v", err)
+	}
+
+	filter := NewContentFilter(nil, nil, nil, nil, nil).WithLogSemantic(logFilter)
+
+	// Test 1: clean response matches log phrase -> does NOT block, but logs
+	resp := textResponse("this contains a log phrase inside")
+	resp.Request = httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	var out strings.Builder
+	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
+
+	_, _, err = writeResponseStreaming(&out, resp, cap, filter)
+	if err != nil {
+		t.Fatalf("writeResponseStreaming() error = %v", err)
+	}
+
+	// The body should pass through fully (untruncated)
+	if !strings.Contains(out.String(), "inside") {
+		t.Fatalf("log phrase matching blocked or truncated the stream: %q", out.String())
+	}
+
+	// Check LogPhraseMatch in context
+	pm, ok := resp.Request.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch)
+	if !ok || !pm.Matched || pm.Suppressed || pm.Value != "log phrase" {
+		t.Fatalf("log phrase match context mismatch: ok=%v, pm=%#v", ok, pm)
+	}
+
+	// Test 2: response matches exception log phrase -> does NOT block, and sets Suppressed
+	respExcept := textResponse("this contains an except log phrase inside")
+	respExcept.Request = httptest.NewRequest(http.MethodGet, "https://example.com/", nil)
+	var outExcept strings.Builder
+	capExcept := newBodyCapture(respExcept.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
+
+	_, _, err = writeResponseStreaming(&outExcept, respExcept, capExcept, filter)
+	if err != nil {
+		t.Fatalf("writeResponseStreaming() error = %v", err)
+	}
+
+	pmExcept, okExcept := respExcept.Request.Context().Value(LogPhraseCtxKey{}).(LogPhraseMatch)
+	if !okExcept || !pmExcept.Suppressed || pmExcept.Matched {
+		t.Fatalf("log phrase exception context mismatch: ok=%v, pm=%#v", okExcept, pmExcept)
 	}
 }

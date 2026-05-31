@@ -1,0 +1,3 @@
+# LucidGate substitution rules.
+# Sintaxis: search => replace   (replace puede quedar vacio para borrar).
+internal codename => public name

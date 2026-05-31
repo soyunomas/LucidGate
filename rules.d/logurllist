@@ -1,0 +1,5 @@
+# Selective audit URL log for Google AI Studio and its Gemini API backend
+https://aistudio.google.com
+https://generativelanguage.googleapis.com
+http://aistudio.google.com
+http://generativelanguage.googleapis.com

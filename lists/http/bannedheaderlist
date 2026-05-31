@@ -1,0 +1,3 @@
+# LucidGate blocked header phrases.
+# Matches against "Header-Name: value" case-insensitively.
+x-tracker: blocked

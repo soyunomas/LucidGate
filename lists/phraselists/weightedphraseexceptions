@@ -1,0 +1,6 @@
+# LucidGate weighted phrase exceptions (e2guardian-style).
+# Sintaxis: <frase><peso> identica a weightedphraselist.
+# Semantica: las frases listadas aqui se EXCLUYEN del scoring weighted en
+# build time (exclusion phrase-level). Si la misma frase aparece tambien en
+# weightedphraselist, no aporta score. No es exclusion de combinaciones.
+<scam><40>

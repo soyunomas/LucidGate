@@ -1,0 +1,3 @@
+# LucidGate blocked cookie phrases.
+# Matches Cookie and Set-Cookie values case-insensitively.
+trackid=

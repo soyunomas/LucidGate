@@ -1,0 +1,5 @@
+# LucidGate banned phrase list (e2guardian-style)
+# Una frase por linea. Comentarios con '#'. Lineas vacias ignoradas.
+# .Include<ruta/al/archivo> incluye otra lista (ruta relativa al fichero actual).
+malware kit
+credential dump

@@ -1,0 +1,3 @@
+# LucidGate site blocklist (un dominio por linea).
+# Subdominios bloqueados automaticamente por el reverse trie.
+example.invalid

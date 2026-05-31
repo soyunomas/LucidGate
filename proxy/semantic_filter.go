@@ -18,10 +18,12 @@ import (
 // the root so a 0 transition from a non-root state is never ambiguous because
 // nextState() walks the fail chain instead of trusting next[b] directly.
 type ahoNode struct {
-	next  [256]int32
-	fail  int32
-	hard  bool
-	score int32
+	next   [256]int32
+	fail   int32
+	hard   bool
+	excpt  bool
+	score  int32
+	phrase string
 }
 
 type PhraseFilter struct {
@@ -39,6 +41,16 @@ func NewPhraseFilter(phrases []string) (*PhraseFilter, error) {
 }
 
 func NewScoredPhraseFilter(blocked []string, weighted []WeightedPhrase, threshold int) (*PhraseFilter, error) {
+	return NewPhraseFilterWithExceptions(blocked, weighted, nil, threshold)
+}
+
+// NewPhraseFilterWithExceptions builds an Aho-Corasick filter with optional
+// exception phrases. When any exception phrase matches the inspected stream,
+// subsequent hard blocks and score accumulations are suppressed for that
+// stream. The exception is detected at the byte its terminal node fires;
+// matches earlier in the same stream still trigger blocks (streaming model
+// cannot rewind bytes already sent to the client).
+func NewPhraseFilterWithExceptions(blocked []string, weighted []WeightedPhrase, exceptions []string, threshold int) (*PhraseFilter, error) {
 	if threshold < 0 {
 		return nil, fmt.Errorf("semantic score threshold cannot be negative")
 	}
@@ -47,7 +59,7 @@ func NewScoredPhraseFilter(blocked []string, weighted []WeightedPhrase, threshol
 		threshold: threshold,
 	}
 	for _, phrase := range blocked {
-		filter.addPhrase(phrase, 0, true)
+		filter.addPhrase(phrase, 0, true, false)
 	}
 	for _, phrase := range weighted {
 		if phrase.Weight <= 0 {
@@ -56,13 +68,16 @@ func NewScoredPhraseFilter(blocked []string, weighted []WeightedPhrase, threshol
 		if threshold == 0 {
 			return nil, fmt.Errorf("semantic score threshold must be positive when weighted phrases are configured")
 		}
-		filter.addPhrase(phrase.Phrase, phrase.Weight, false)
+		filter.addPhrase(phrase.Phrase, phrase.Weight, false, false)
+	}
+	for _, phrase := range exceptions {
+		filter.addPhrase(phrase, 0, false, true)
 	}
 	filter.buildFailures()
 	return filter, nil
 }
 
-func (f *PhraseFilter) addPhrase(phrase string, score int, hard bool) {
+func (f *PhraseFilter) addPhrase(phrase string, score int, hard, exception bool) {
 	normalized := normalizePhrase(phrase)
 	if normalized == "" {
 		return
@@ -79,7 +94,11 @@ func (f *PhraseFilter) addPhrase(phrase string, score int, hard bool) {
 		node = next
 	}
 	f.nodes[node].hard = f.nodes[node].hard || hard
+	f.nodes[node].excpt = f.nodes[node].excpt || exception
 	f.nodes[node].score += int32(score)
+	if hard || score > 0 || exception {
+		f.nodes[node].phrase = phrase
+	}
 }
 
 func normalizePhrase(phrase string) string {
@@ -114,7 +133,11 @@ func (f *PhraseFilter) buildFailures() {
 			fail := f.nodes[node].fail
 			f.nodes[child].fail = f.nodes[fail].next[b]
 			f.nodes[child].hard = f.nodes[child].hard || f.nodes[f.nodes[child].fail].hard
+			f.nodes[child].excpt = f.nodes[child].excpt || f.nodes[f.nodes[child].fail].excpt
 			f.nodes[child].score += f.nodes[f.nodes[child].fail].score
+			if f.nodes[child].phrase == "" {
+				f.nodes[child].phrase = f.nodes[f.nodes[child].fail].phrase
+			}
 			queue = append(queue, child)
 		}
 	}
@@ -128,10 +151,50 @@ func (f *PhraseFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
 	return f.NewFilter().ProcessChunk(in)
 }
 
+type Decisioner interface {
+	Decision() (blocked bool, matchType string, value string)
+}
+
+type LogDecisioner interface {
+	LogDecision() (matched bool, suppressed bool, matchType string, value string)
+}
+
+type LogPhraseCtxKey struct{}
+
+type LogPhraseMatch struct {
+	Matched    bool
+	Suppressed bool
+	MatchType  string
+	Value      string
+}
+
 type phraseStreamFilter struct {
-	compiled *PhraseFilter
-	node     int32
-	score    int32
+	compiled      *PhraseFilter
+	node          int32
+	score         int32
+	excepted      bool
+	blockedPhrase string
+	blockedType   string
+	observeOnly   bool
+}
+
+func (f *phraseStreamFilter) Decision() (bool, string, string) {
+	if f.blockedPhrase != "" && !f.observeOnly {
+		return true, f.blockedType, f.blockedPhrase
+	}
+	return false, "", ""
+}
+
+func (f *phraseStreamFilter) LogDecision() (bool, bool, string, string) {
+	if f.observeOnly {
+		if f.excepted {
+			return false, true, "", ""
+		}
+		if f.blockedPhrase != "" {
+			return true, false, f.blockedType, f.blockedPhrase
+		}
+	}
+	return false, false, "", ""
 }
 
 func (f *phraseStreamFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
@@ -155,26 +218,44 @@ func (f *phraseStreamFilter) matchChunk(in []byte) (bool, int, error) {
 	nodes := f.compiled.nodes
 	node := f.node
 	score := f.score
+	excepted := f.excepted
 	threshold := int32(f.compiled.threshold)
 	for i, b := range in {
 		node = nodes[node].next[lowerASCII(b)]
 		current := &nodes[node]
+		if current.excpt {
+			excepted = true
+		}
+		if excepted {
+			continue
+		}
 		if current.hard {
-			f.node = node
-			f.score = score
-			return true, i + 1, nil
+			f.blockedPhrase = current.phrase
+			f.blockedType = "phrase"
+			if !f.observeOnly {
+				f.node = node
+				f.score = score
+				f.excepted = excepted
+				return true, i + 1, nil
+			}
 		}
 		if current.score > 0 {
 			score += current.score
 			if threshold > 0 && score >= threshold {
-				f.node = node
-				f.score = score
-				return true, i + 1, nil
+				f.blockedPhrase = current.phrase
+				f.blockedType = "phrase_score"
+				if !f.observeOnly {
+					f.node = node
+					f.score = score
+					f.excepted = excepted
+					return true, i + 1, nil
+				}
 			}
 		}
 	}
 	f.node = node
 	f.score = score
+	f.excepted = excepted
 	return false, len(in), nil
 }
 

@@ -1,0 +1,4 @@
+# LucidGate blocked MIME types.
+# Exact MIME types and type/* wildcards are supported.
+application/x-msdownload
+application/x-dosexec

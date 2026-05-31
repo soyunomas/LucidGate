@@ -1,0 +1,4 @@
+# LucidGate masking phrase list.
+# Cada frase se sustituira por '*' del mismo largo en el cuerpo HTTP.
+apikey-12345
+internal-secret-token

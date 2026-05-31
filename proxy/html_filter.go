@@ -21,6 +21,20 @@ func newHTMLTextFilter(inner FilterEngine) FilterEngine {
 	return &htmlTextFilter{inner: inner}
 }
 
+func (f *htmlTextFilter) Decision() (bool, string, string) {
+	if dec, ok := f.inner.(Decisioner); ok {
+		return dec.Decision()
+	}
+	return false, "", ""
+}
+
+func (f *htmlTextFilter) LogDecision() (bool, bool, string, string) {
+	if ld, ok := f.inner.(LogDecisioner); ok {
+		return ld.LogDecision()
+	}
+	return false, false, "", ""
+}
+
 func (f *htmlTextFilter) ProcessChunk(in []byte) ([]byte, bool, error) {
 	for i, b := range in {
 		visible, emit := f.consumeByte(b)

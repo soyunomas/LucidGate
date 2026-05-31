@@ -1,0 +1,4 @@
+# LucidGate weighted phrase list (e2guardian-style)
+# Sintaxis: <frase><peso>   con peso entero positivo.
+<malware><60>
+<payload><40>

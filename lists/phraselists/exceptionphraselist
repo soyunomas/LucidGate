@@ -1,0 +1,8 @@
+# LucidGate exception phrase list (e2guardian-style).
+# Frases que NO deben disparar el bloqueo. Cuando una de estas frases hace
+# match en el cuerpo, el stream queda "excepted" y a partir de ese byte se
+# ignoran tanto bloqueos hard como acumulacion de score weighted.
+# Limitacion: si un bloqueo hard precede a la excepcion en bytes, el bloqueo
+# prevalece (el motor es streaming y no puede rebobinar bytes ya enviados).
+malware research
+threat intelligence

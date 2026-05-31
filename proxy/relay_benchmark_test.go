@@ -25,7 +25,7 @@ func BenchmarkWriteResponseStreaming10GiB(b *testing.B) {
 			MaxCaptureBytes: 1,
 		})
 
-		n, err := writeResponseStreaming(io.Discard, resp, cap, nil)
+		n, _, err := writeResponseStreaming(io.Discard, resp, cap, nil)
 		if err != nil {
 			b.Fatalf("writeResponseStreaming() error = %v", err)
 		}

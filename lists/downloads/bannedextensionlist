@@ -1,0 +1,5 @@
+# LucidGate blocked download extensions.
+# Accepts ".exe" or "exe"; matching is case-insensitive.
+.exe
+.scr
+.msi

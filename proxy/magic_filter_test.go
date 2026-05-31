@@ -215,7 +215,7 @@ func TestWriteResponseStreamingBlocksDisguisedExecutable(t *testing.T) {
 
 	var out bytes.Buffer
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
-	if _, err := writeResponseStreaming(&out, resp, cap, filter); err != nil {
+	if _, _, err := writeResponseStreaming(&out, resp, cap, filter); err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
 
@@ -242,7 +242,7 @@ func TestWriteResponseStreamingPassesCleanBinary(t *testing.T) {
 
 	var out bytes.Buffer
 	cap := newBodyCapture(resp.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 1})
-	if _, err := writeResponseStreaming(&out, resp, cap, filter); err != nil {
+	if _, _, err := writeResponseStreaming(&out, resp, cap, filter); err != nil {
 		t.Fatalf("writeResponseStreaming() error = %v", err)
 	}
 	if !bytes.Contains(out.Bytes(), payload[:32]) {

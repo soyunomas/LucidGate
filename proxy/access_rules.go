@@ -4,26 +4,31 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+
+	"github.com/gaissmai/bart"
 )
 
 type AccessProfile struct {
-	Name    string
-	Clients []string
-	Default bool
+	Name      string
+	Clients   []string
+	Default   bool
+	MaxConns  *int
+	RateLimit *float64
+	RateBurst *int
 }
 
 type AccessRules struct {
-	entries        []accessEntry
+	entries        bart.Table[string]
 	defaultProfile string
-}
-
-type accessEntry struct {
-	prefix  netip.Prefix
-	profile string
+	banned         bart.Table[bool]
+	exceptions     bart.Table[bool]
+	profiles       map[string]AccessProfile
 }
 
 func NewAccessRules(profiles []AccessProfile) (*AccessRules, error) {
-	rules := &AccessRules{}
+	rules := &AccessRules{
+		profiles: make(map[string]AccessProfile),
+	}
 	if len(profiles) == 0 {
 		rules.defaultProfile = "default"
 		return rules, nil
@@ -32,6 +37,7 @@ func NewAccessRules(profiles []AccessProfile) (*AccessRules, error) {
 		if profile.Name == "" {
 			return nil, fmt.Errorf("access profile name cannot be empty")
 		}
+		rules.profiles[profile.Name] = profile
 		if profile.Default {
 			if rules.defaultProfile != "" {
 				return nil, fmt.Errorf("multiple default access profiles")
@@ -47,13 +53,48 @@ func NewAccessRules(profiles []AccessProfile) (*AccessRules, error) {
 				}
 				prefix = netip.PrefixFrom(addr, addr.BitLen())
 			}
-			rules.entries = append(rules.entries, accessEntry{
-				prefix:  prefix.Masked(),
-				profile: profile.Name,
-			})
+			rules.entries.Insert(prefix.Masked(), profile.Name)
 		}
 	}
 	return rules, nil
+}
+
+func (r *AccessRules) SetBanned(banned []string) error {
+	if r == nil {
+		return nil
+	}
+	r.banned = bart.Table[bool]{}
+	for _, entry := range banned {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			addr, addrErr := netip.ParseAddr(entry)
+			if addrErr != nil {
+				return fmt.Errorf("banned client %q: %w", entry, err)
+			}
+			prefix = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		r.banned.Insert(prefix.Masked(), true)
+	}
+	return nil
+}
+
+func (r *AccessRules) SetExceptions(exceptions []string) error {
+	if r == nil {
+		return nil
+	}
+	r.exceptions = bart.Table[bool]{}
+	for _, entry := range exceptions {
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			addr, addrErr := netip.ParseAddr(entry)
+			if addrErr != nil {
+				return fmt.Errorf("exception client %q: %w", entry, err)
+			}
+			prefix = netip.PrefixFrom(addr, addr.BitLen())
+		}
+		r.exceptions.Insert(prefix.Masked(), true)
+	}
+	return nil
 }
 
 func (r *AccessRules) ProfileForRemoteAddr(remoteAddr string) (string, bool) {
@@ -68,13 +109,35 @@ func (r *AccessRules) ProfileForRemoteAddr(remoteAddr string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	for _, entry := range r.entries {
-		if entry.prefix.Contains(addr) {
-			return entry.profile, true
+
+	// 1. Check if client IP is explicitly exempted
+	if _, excepted := r.exceptions.Lookup(addr); excepted {
+		// client is exempted from bans, fallback directly to profiles
+	} else {
+		// 2. Check if client IP is explicitly banned
+		if _, banned := r.banned.Lookup(addr); banned {
+			return "", false
 		}
 	}
+
+	// 3. Fallback to standard access profile evaluation via LPM
+	if profile, ok := r.entries.Lookup(addr); ok {
+		return profile, true
+	}
+
 	if r.defaultProfile != "" {
 		return r.defaultProfile, true
 	}
 	return "", false
+}
+
+func (r *AccessRules) ProfileLimits(profileName string) (maxConns *int, rateLimit *float64, rateBurst *int, exists bool) {
+	if r == nil || r.profiles == nil {
+		return nil, nil, nil, false
+	}
+	p, ok := r.profiles[profileName]
+	if !ok {
+		return nil, nil, nil, false
+	}
+	return p.MaxConns, p.RateLimit, p.RateBurst, true
 }

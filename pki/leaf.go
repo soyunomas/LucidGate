@@ -117,6 +117,12 @@ func GenerateLeafCert(hostname string, rootCA *x509.Certificate, rootKey crypto.
 	return &cert, nil
 }
 
+var (
+	OnCacheRequest func()
+	OnCacheHit     func()
+	OnCertGenerate func(duration time.Duration)
+)
+
 // DefaultLeafCacheSize bounds the LeafCache to avoid unbounded memory growth
 // under SNI scans / wildcard CDNs (*.googlevideo.com, *.fbcdn.net) that would
 // otherwise fill the map indefinitely. Empirically 4096 entries cover any
@@ -168,6 +174,12 @@ func (c *LeafCache) Get(hostname string) (*tls.Certificate, error) {
 	if cert, ok := c.lru.get(host); ok {
 		c.mu.Unlock()
 		if leafStillValid(cert) {
+			if OnCacheRequest != nil {
+				OnCacheRequest()
+			}
+			if OnCacheHit != nil {
+				OnCacheHit()
+			}
 			return cert, nil
 		}
 		// expired or near expiry: drop and regenerate
@@ -177,13 +189,28 @@ func (c *LeafCache) Get(hostname string) (*tls.Certificate, error) {
 	if pending, ok := c.pending[host]; ok {
 		c.mu.Unlock()
 		<-pending.done
+		if OnCacheRequest != nil {
+			OnCacheRequest()
+		}
+		if OnCacheHit != nil {
+			OnCacheHit()
+		}
 		return pending.cert, pending.err
 	}
 	pending := &pendingCert{done: make(chan struct{})}
 	c.pending[host] = pending
 	c.mu.Unlock()
 
+	if OnCacheRequest != nil {
+		OnCacheRequest()
+	}
+
+	start := time.Now()
 	cert, err := GenerateLeafCert(host, c.rootCA, c.rootKey)
+	duration := time.Since(start)
+	if OnCertGenerate != nil {
+		OnCertGenerate(duration)
+	}
 	pending.cert = cert
 	pending.err = err
 	close(pending.done)
@@ -218,9 +245,9 @@ func leafStillValid(cert *tls.Certificate) bool {
 // dependency surface vs. ~30 LOC here). Not safe for concurrent use; the
 // enclosing LeafCache holds the mutex.
 type lruCache struct {
-	cap  int
-	ll   *list
-	idx  map[string]*lruNode
+	cap int
+	ll  *list
+	idx map[string]*lruNode
 }
 
 type lruNode struct {
