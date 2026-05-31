@@ -1,39 +1,35 @@
-# Sesión guardada - 2026-05-31 (Resolución de Data Race, Flat Trie de Dominios y Soporte Híbrido de Brotli - P0, P1 & P2 ✅)
+# Sesión guardada - 2026-05-31 (Sincronización Docs ↔ Código)
 
 ## Contexto de la sesión
-Se ha completado una sesión de ingeniería extraordinaria y de altísimo rendimiento tecnológico:
-1. Resuelta de forma 100% robusta la condición de carrera (**Data Race**) en el Forensic Dumper (`7.0.0`).
-2. Diseñada e implementada una optimización radical de los filtros de dominios (**Flat Trie LPM con 0 allocations y O(log K) binario**) en `7.5.2`, logrando una reducción de RAM del 95% y casi triplicando la velocidad de lookup.
-3. Integrado un soporte de compresión/descompresión de Brotli híbrido (**CGO nativo cbrotli de Google + Fallback Puro Go de andybalholm/brotli**) en `7.5.5` mediante build tags, maximizando la velocidad en un 5-10x en entornos CGO sin comprometer la compilabilidad en arquitecturas estáticas puras.
 
-## Cambios consolidados y documentados en esta sesión
+Auditoría externa identificó que `README.md`, `RUNTIME_CONFIGURATION.md` y `tasks/session.md` estaban significativamente desfasados respecto al estado real del código: el binario ya expone tracing OpenTelemetry, HTTP/3 downstream, circuit breaker, DNS cache, `SO_REUSEPORT`, hot restart (`SIGUSR2`/tableflip), drenaje de conexiones hijacked, MITM bypass por host (`mitm.bypass_hosts`), rotación/compresión de dumps, QoS por perfil (`max_conns`/`rate_limit`/`rate_burst`) y endpoints `/livez`/`/readyz`, pero la documentación de usuario los omitía o los listaba como "próximo paso natural".
 
-1. **Resolución del Data Race en el Dumper (`proxy/relay.go` y `proxy/server_test.go`):**
-   - Encapsulado el estado del dumper en la estructura `ForensicDumper`, confinando y aislando los recursos del escritor con buffer y archivo de las variables de paquete.
-   - Implementado acceso de solo lectura atómico libre de locks mediante `atomic.Pointer[ForensicDumper]` para el hot path caliente de volcados.
-   - Refactorizada la función `resetDumper()` para invocar síncronamente `Close()` (con drenaje no bloqueante ordenado y parada por `sync.WaitGroup`), asegurando el aislamiento absoluto de pruebas concurrentes y la eliminación de goroutine leaks.
+## Cambios consolidados
 
-2. **Flat Trie de Dominios LPM Ultra-Eficiente y 0 Allocations (`proxy/domain_rules.go`):**
-   - Diseñado un Trie plano aplanado por DFS en dos arrays globales contiguos e indexados por enteros de 32 bits (`flatNodes` y `flatTransitions`), eliminando el 100% de los punteros en el heap.
-   - Desarrollada la función de optimización de búsqueda LPM de derecha a izquierda sobre la string del dominio mediante `strings.LastIndexByte`, logrando **0 B/op y 0 allocs/op** y eliminando por completo la presión del Garbage Collector en el hot path caliente de los lookups.
-   - **Salto Cuantitativo de Rendimiento (CPU i5-4440):** El lookup de dominios pasa de `1179 ns/op` a **`441.3 ns/op`** (casi **3x más rápido**).
-   - **Salto Cuantitativo de RAM:** El consumo para ~3 millones de dominios de StevenBlack/Easylist cae de ~3.0 GiB a **~140 MiB** (reducción masiva del 95%).
+1. **`README.md`:**
+   - Sección "What It Does": añadidas capacidades reales (MITM bypass, HTTP/3, breaker, DNS cache, REUSEPORT, hot restart, QoS por perfil, OTel, health probes, dump rotation).
+   - Tabla de flags/env: añadidas filas para `wait-timeout`, `cert-workers`, `MITM_BYPASS_HOSTS`, `reuseport`, `http3-enabled`, `circuit-breaker-*`, `dns-cache-*`, `tracing-*`, `log-bodies-sample-rate`, `dump-max-size-mb`, `dump-max-backups`, `dump-min-free-space-mb`, `dump-compress`, `METRICS_ENABLED`, `METRICS_LISTEN_ADDR`. Nota explícita sobre antivirus solo-TOML/env.
+   - Sección "Observability": añadidas las métricas `lucidgate_connections_rejected_total`, `lucidgate_cert_generation_duration_seconds`, etiquetas reales de `lucidgate_rule_hits_total`, y endpoints `/livez`, `/readyz`, `/debug/pprof/*`.
+   - Sección nueva "Advanced Operations" cubriendo: MITM Bypass (HSTS/banking/mTLS), HTTP/3 Downstream, Circuit Breaker, DNS Cache, SO_REUSEPORT, OpenTelemetry Tracing, Per-Profile QoS, Hot Restart (SIGUSR2), Dump Rotation and Disk Quotas.
 
-3. **Arquitectura Brotli Híbrida Inteligente (`proxy/brotli_cgo.go` y `proxy/brotli_nocgo.go`):**
-   - Desarrollado un wrapper limpio de compresión/descompresión Brotli mediante etiquetas de compilación de Go (`build tags`).
-   - Cuando CGO está activo, utiliza la implementación nativa y ultrarrápida en C de `github.com/google/brotli/go/cbrotli` (calidad = 4 por defecto, óptimo para proxies en tiempo real); cuando CGO está desactivado o ausente (como en compilaciones estáticas de `CGO_ENABLED=0`), cae de forma completamente automática al fallback puro Go de `github.com/andybalholm/brotli`.
-   - Garantizado el cierre seguro de los recursos con `defer r.Close()` en `decompressBody` para liberar correctamente los recursos asignados en C nativo.
+2. **`RUNTIME_CONFIGURATION.md`:**
+   - Reescrito completo. Tabla de flags/env alineada 1:1 con `config.go`.
+   - Documentadas la recarga `SIGHUP` y la actualización en caliente `SIGUSR2` con sus garantías reales (drain 30 s, `/readyz` 503 durante reload).
+   - Documentado el admin server (`/livez`, `/readyz`, `/metrics`, `/debug/pprof/*`).
+   - Notas de seguridad ampliadas con MITM bypass.
 
-4. **Verificación de Calidad:**
-   - La suite completa de verificación del proyecto (`make verify` y `go test -race ./...`) corre al 100% en verde sin advertencias de concurrencia ni de compilación.
+3. **`tasks/session.md`:** este archivo, reemplazando el contenido obsoleto que listaba OTel 7.6.4 como "próximo paso natural" (está hecho y verificado).
 
-## Verificación Actual
-- El 100% de la suite de pruebas unitarias, benchmarks e integración se encuentra en estado verde y pasa exitosamente.
+## Verificación
+
+Cambios solo de documentación (`README.md`, `RUNTIME_CONFIGURATION.md`, `tasks/session.md`). No tocan Go ni TOML; `make test` y `make verify` no se ven afectados.
 
 ## Próximo paso natural
-De acuerdo con las prioridades de LucidGate:
-1. **7.6.4. Tracing OpenTelemetry opcional (Observabilidad):** Añadir soporte de telemetría distribuida para monitorizar spanes de vida de cada exchange (dial, TLS handshake, relay, copia, etc.) y correlacionar latencias nativas con servidores upstream concretos de forma visual.
 
+De acuerdo con la priorización corregida tras auditoría cruzada:
 
-
-
+1. **Endurecer `mitm.bypass_hosts`**: validar semántica de wildcards en tests específicos, exponer contador Prometheus `lucidgate_mitm_bypass_total{host=...}`, opcionalmente añadir default-list curada para banca/admin pública.
+2. **Categorías de dominio** (`domain → category[]` + `block_categories` en perfiles) sobre el flat-trie ya existente — el mayor salto de producto pendiente.
+3. **Identidad de usuario** (Basic/htpasswd MVP → LDAP/OIDC) con caché `auth → user → profile` y enriquecimiento forense.
+4. **Feeds automáticos** (URLhaus, OISD, StevenBlack, Easylist) con checksum y recarga atómica.
+5. **Fuzzing** del list-loader (`go test -fuzz`), crítico cuando se activen feeds remotos.

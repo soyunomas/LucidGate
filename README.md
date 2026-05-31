@@ -30,6 +30,13 @@ Use it only on systems and traffic you own or are explicitly authorized to inspe
 - Bypass for binary, multipart, request-compressed, and unsupported response-compressed payloads.
 - Optional bounded JSONL body dump for offline analysis.
 - External e2guardian-style phrase, masking, and substitution lists with `.Include<...>` recursion and per-file/line error reporting.
+- Per-host MITM bypass list (`mitm.bypass_hosts`) for HSTS-pinned/banking/mTLS sites, with `*.example.com` wildcards and zero-copy `splice(2)` tunneling.
+- Optional HTTP/3 (QUIC) downstream listener via `quic-go/http3` with dynamic MITM leaf certificates.
+- Per-host upstream circuit breaker (`sony/gobreaker`), TTL-cached internal DNS resolver, `SO_REUSEPORT` multi-listener mode, and zero-downtime hot restart via `cloudflare/tableflip` (`SIGUSR2`).
+- Per-profile concurrency cap (`max_conns`) and per-client-IP token-bucket rate limiting (`rate_limit`/`rate_burst`).
+- OpenTelemetry distributed tracing of every exchange (parent span + dial/handshake/request/response children) via OTLP gRPC; noop fallback with zero cost when disabled.
+- Liveness/readiness probes (`/livez`, `/readyz`) and Prometheus rejection counters by reason on the loopback admin server.
+- Dump rotation, gzip compression, and disk-space-aware skipping for forensic JSONL files.
 
 ## Security Notes
 
@@ -178,21 +185,45 @@ html_banner = "<div style=\"position:fixed;left:0;right:0;bottom:0;z-index:21474
 | `--listen` | `LUCIDGATE_LISTEN_ADDR` | `127.0.0.1:8080` | Local proxy listen address. |
 | `--cert-dir` | `LUCIDGATE_CERT_DIR` | `certs` | Directory for `ca.crt` and `ca.key`. |
 | `--max-connections` | `LUCIDGATE_MAX_CONNECTIONS` | `1024` | Maximum concurrent CONNECT tunnels. |
+| `--wait-timeout` | `LUCIDGATE_WAIT_TIMEOUT` | `250ms` | Connection admission queue wait timeout before returning `503`. `0` disables waiting (instant 503 on saturation). |
 | `--io-timeout` | `LUCIDGATE_IO_TIMEOUT` | `30s` | Per-operation relay read/write timeout. |
 | `--ws-idle-timeout` | `LUCIDGATE_WS_IDLE_TIMEOUT` | `5m` | Per-direction idle timeout for raw WebSocket sessions after a successful Upgrade. |
 | `--dial-timeout` | `LUCIDGATE_DIAL_TIMEOUT` | `10s` | Upstream TCP/uTLS dial timeout. |
 | `--upstream-max-idle-conns-per-host` | `LUCIDGATE_UPSTREAM_MAX_IDLE_CONNS_PER_HOST` | `32` | Maximum idle upstream keep-alive connections per destination; `0` disables pooling. |
 | `--upstream-idle-timeout` | `LUCIDGATE_UPSTREAM_IDLE_TIMEOUT` | `90s` | Maximum time an idle upstream keep-alive connection stays pooled. |
 | `--handshake-timeout` | `LUCIDGATE_HANDSHAKE_TIMEOUT` | `5s` | Browser-side TLS handshake timeout. |
+| `--cert-workers` | `LUCIDGATE_CERT_WORKERS` | `runtime.NumCPU()` | Background workers that pre-generate MITM leaf certificates outside the hot handshake path. |
 | `--mitm-prewarm-hosts` | `LUCIDGATE_MITM_PREWARM_HOSTS` | empty | Comma-separated popular hostnames to pre-generate MITM leaf certificates for. |
+| — | `LUCIDGATE_MITM_BYPASS_HOSTS` | empty | Comma-separated hostnames (supports `*.example.com`) that bypass TLS interception and tunnel CONNECT with zero-copy `splice(2)`. Same as `[mitm].bypass_hosts` in TOML. |
+| `--reuseport` | `LUCIDGATE_REUSEPORT` | `false` | Enable `SO_REUSEPORT` with `GOMAXPROCS` concurrent listeners (Linux/UNIX only). |
+| `--http3-enabled` | `LUCIDGATE_HTTP3_ENABLED` | `false` | Enable concurrent HTTP/3 (QUIC) downstream listener on the same UDP port. |
+| `--circuit-breaker-enabled` | `LUCIDGATE_CIRCUIT_BREAKER_ENABLED` | `true` | Enable per-host upstream circuit breaker. |
+| `--circuit-breaker-failures` | `LUCIDGATE_CIRCUIT_BREAKER_FAILURES` | `5` | Consecutive failures before tripping the breaker open. |
+| `--circuit-breaker-timeout` | `LUCIDGATE_CIRCUIT_BREAKER_TIMEOUT` | `30s` | Time the breaker stays open before transitioning to half-open. |
+| `--dns-cache-enabled` | `LUCIDGATE_DNS_CACHE_ENABLED` | `true` | Enable internal TTL-cached DNS resolver. |
+| `--dns-cache-ttl` | `LUCIDGATE_DNS_CACHE_TTL` | `60s` | TTL for cached DNS records. |
+| `--tracing-enabled` | `LUCIDGATE_TRACING_ENABLED` | `false` | Enable OpenTelemetry distributed tracing of every exchange. |
+| `--tracing-endpoint` | `LUCIDGATE_TRACING_ENDPOINT` | `localhost:4317` | OTLP gRPC collector endpoint (`host:port`). |
+| `--tracing-insecure` | `LUCIDGATE_TRACING_INSECURE` | `true` | Use insecure (plaintext) gRPC against the OTLP collector. |
+| `--tracing-service-name` | `LUCIDGATE_TRACING_SERVICE_NAME` | `lucidgate` | `service.name` attribute reported to the collector. |
+| `--tracing-sample-rate` | `LUCIDGATE_TRACING_SAMPLE_RATE` | `1.0` | Trace sample rate (`0.0` disables exports while keeping context propagation). |
 | `--log-bodies` | `LUCIDGATE_LOG_BODIES` | `true` | Enable byte-count body capture behavior. |
+| — | `LUCIDGATE_LOG_BODIES_SAMPLE_RATE` | `1.0` | Probability (`0.0`–`1.0`) that an exchange is sampled for body byte counting. |
 | `--max-capture-bytes` | `LUCIDGATE_MAX_CAPTURE_BYTES` | `1048576` | Maximum bytes captured per body; `0` disables capture. |
 | `--dump-dir` | `LUCIDGATE_DUMP_DIR` | empty | Write bounded JSONL cleartext dumps when non-empty. |
 | `--dump-on-policy-hit` | `LUCIDGATE_DUMP_ON_POLICY_HIT` | `false` | If true, only write body dumps to `dump-dir` when a policy blocks or matches audit logs. |
 | `--dump-credentials-cleartext` | `LUCIDGATE_DUMP_CREDENTIALS_CLEARTEXT` | `false` | Enable cleartext credentials dumping (authorized environments only, requires `dump_on_policy_hit=true`). |
 | `--audit-key` | `LUCIDGATE_AUDIT_KEY` | empty | Secret key for cryptographically hashing sensitive credentials (HMAC-SHA256) for forensic correlation. |
+| `--dump-max-size-mb` | `LUCIDGATE_DUMP_MAX_SIZE_MB` | `100` | Maximum size of a single dump file (MB) before rotation. |
+| `--dump-max-backups` | `LUCIDGATE_DUMP_MAX_BACKUPS` | `10` | Maximum rotated dump backups to keep. |
+| `--dump-min-free-space-mb` | `LUCIDGATE_DUMP_MIN_FREE_SPACE_MB` | `1024` | Minimum free disk space (MB) before skipping payload dumps with a `low disk space` warning. |
+| `--dump-compress` | `LUCIDGATE_DUMP_COMPRESS` | `true` | Compress rotated dump files with gzip in background. |
+| — | `LUCIDGATE_METRICS_ENABLED` | `false` | Mount Prometheus `/metrics` on the admin server. Same as `[metrics].enabled` in TOML. |
+| — | `LUCIDGATE_METRICS_LISTEN_ADDR` | `127.0.0.1:6060` | Admin server listen address (`/metrics`, `/debug/pprof`, `/livez`, `/readyz`). |
 | `--upstream-insecure-skip-verify` | `LUCIDGATE_UPSTREAM_INSECURE_SKIP_VERIFY` | `false` | Skip upstream TLS verification. Lab/smoke only. |
 | `--version` | none | `false` | Print version and exit. |
+
+The antivirus subsystem is configured exclusively via `[antivirus]` in TOML (`enabled`, `clamav_addr`, `temp_dir`, `trickle_interval`, `scan_timeout`) or matching `LUCIDGATE_ANTIVIRUS_*` environment variables. There are no command-line flags for antivirus.
 
 ## Observability
 
@@ -212,9 +243,11 @@ Useful LucidGate metrics:
 
 - `lucidgate_active_connections`
 - `lucidgate_bytes_total{direction="in|out"}`
+- `lucidgate_connections_rejected_total{reason="max_connections|wait_timeout|rate_limit|profile_saturated|access_denied|schedule_denied|circuit_open"}`
 - `lucidgate_cert_cache_requests_total`
 - `lucidgate_cert_cache_hits_total`
-- `lucidgate_rule_hits_total`
+- `lucidgate_cert_generation_duration_seconds`
+- `lucidgate_rule_hits_total{profile,policy_list,action="block|log"}`
 - `lucidgate_inspection_duration_seconds`
 - `lucidgate_tls_handshake_duration_seconds{direction="downstream"}`
 - `lucidgate_alt_svc_stripped_total`
@@ -222,6 +255,121 @@ Useful LucidGate metrics:
 - `lucidgate_websocket_bytes_total{direction="in|out"}`
 
 The Prometheus Go/process collectors are also available from the same endpoint. Use `go_goroutines`, `process_open_fds`, and `process_max_fds` while running connection-load tests.
+
+The admin server also exposes:
+
+- `GET /livez` — liveness probe, always `200 OK` while the process is alive.
+- `GET /readyz` — readiness probe. Returns `503 Service Unavailable` while a `SIGHUP` reload is in progress, during shutdown, or when the global connection semaphore is saturated; `200 OK` otherwise.
+- `GET /debug/pprof/*` — standard Go pprof endpoints.
+
+## Advanced Operations
+
+### MITM Bypass (HSTS-pinned, banking, mTLS apps)
+
+Some hosts (banks, government portals, apps with certificate pinning) reject the locally-generated leaf certificate and will not work through a MITM proxy. Add them to `[mitm].bypass_hosts` to tunnel CONNECT verbatim with zero-copy `splice(2)` instead of terminating TLS locally:
+
+```toml
+[mitm]
+bypass_hosts = [
+  "*.bancosantander.es",
+  "*.bbva.es",
+  "agenciatributaria.gob.es",
+  "*.icloud.com",
+]
+```
+
+Bypassed hosts skip TLS termination and all content filters (semantic, masking, substitution, antivirus). Domain-level policy (`bannedsitelist`, access profiles, schedules) still applies because they are evaluated against the CONNECT target before bypass takes effect. Wildcards (`*.example.com`) match the apex domain and every subdomain.
+
+### HTTP/3 (QUIC) Downstream
+
+```toml
+[server]
+http3_enabled = true
+```
+
+When enabled, LucidGate opens a UDP listener on the same port as the TCP listener and serves `h3` via `quic-go/http3`. Browser clients that prefer QUIC will negotiate H3 directly against the proxy. The downstream TLS handshake reuses the same dynamic leaf certificate cache. Upstream traffic still uses TCP (HTTP/1.1 or H2). This avoids browsers leaking traffic over QUIC straight to the Internet when `Alt-Svc` advertising is stripped from upstream responses.
+
+### Upstream Circuit Breaker
+
+A per-host circuit breaker (`sony/gobreaker`) opens after a configurable number of consecutive upstream failures and short-circuits with `HTTP 502 Bad Gateway` until the cooldown window elapses, protecting local FDs and RAM during upstream outages.
+
+```toml
+[server]
+circuit_breaker_enabled  = true
+circuit_breaker_failures = 5
+circuit_breaker_timeout  = "30s"
+```
+
+### DNS Cache
+
+```toml
+[server]
+dns_cache_enabled = true
+dns_cache_ttl     = "60s"
+```
+
+The internal resolver caches `A`/`AAAA` lookups with TTL to avoid repeated syscalls on the hot dial path. Raw IPv4/IPv6 literals bypass the cache. Disable only for short-lived hosts whose DNS changes faster than the TTL.
+
+### SO_REUSEPORT (Linux)
+
+```toml
+[server]
+reuseport = true
+```
+
+LucidGate opens `GOMAXPROCS` parallel listeners on the same `listen_addr` using `SO_REUSEPORT`, letting the kernel load-balance accept queues across cores. Useful above ~10k accepted connections/sec.
+
+### OpenTelemetry Tracing
+
+```toml
+[tracing]
+enabled      = true
+endpoint     = "localhost:4317"
+insecure     = true
+service_name = "lucidgate"
+sample_rate  = 1.0
+```
+
+When disabled (default) the tracer falls back to a noop provider with zero allocations on the hot path. When enabled, each exchange produces a parent `Exchange` span with child spans for `Upstream Dial`, `TLS Handshake Downstream`, `Request Processing`, and `Response Processing`, exported via OTLP gRPC. Standard W3C Trace Context headers are propagated so traces correlate across services. Span flush has a 5 s shutdown budget.
+
+### Per-Profile QoS
+
+Each access profile can declare its own concurrency cap and token-bucket rate limit, on top of the global `max_connections` semaphore:
+
+```toml
+[[access.profile]]
+name       = "students"
+clients    = ["10.0.10.0/24"]
+max_conns  = 256          # per-profile concurrent slots
+rate_limit = 50           # tokens per second per client IP
+rate_burst = 100          # burst budget per client IP
+```
+
+Per-IP rate limiters live in a 16,384-entry LRU and run in the *fail-fast* phase before any handshake. Abusive IPs receive `HTTP 429` without consuming concurrency slots. `rate_limit` and `rate_burst` must be configured together.
+
+### Hot Restart (zero-downtime upgrade)
+
+Send `SIGUSR2` to the running process to re-exec the binary inheriting listening sockets via `cloudflare/tableflip`. In-flight CONNECT/WebSocket tunnels are drained with a 30 s grace timeout (`drainHijacked`) before the old process exits, so existing downloads and WebSocket sessions are not interrupted.
+
+```bash
+# Replace /usr/bin/lucidgate atomically, then:
+kill -USR2 "$(pgrep -f lucidgate)"
+```
+
+### Dump Rotation and Disk Quotas
+
+Forensic dumps rotate by size, are gzip-compressed in background, and are skipped automatically when free disk space falls below a configurable threshold:
+
+```toml
+[logging]
+dump_dir              = "dumps"
+dump_max_size_mb      = 100
+dump_max_backups      = 10
+dump_min_free_space_mb = 1024     # skip writes if free space falls below this
+dump_compress         = true
+```
+
+If free space is below `dump_min_free_space_mb`, the dump entry is annotated with `skipped: "low disk space warning"` and the payload is dropped without touching disk. The free-space check walks up the path to the closest existing ancestor, so the dump directory does not need to exist yet.
 
 ## Rule Lists
 
