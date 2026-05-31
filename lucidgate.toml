@@ -1,29 +1,64 @@
 [server]
-listen_addr = "127.0.0.1:8080"
+# Escucha en todas las interfaces del PC para permitir conexiones locales y externas
+listen_addr = "0.0.0.0:8080"
 cert_dir = "certs"
 handshake_timeout = "5s"
-max_connections = 100
+max_connections = 2048
+wait_timeout = "250ms"
+cert_workers = 4
 io_timeout = "10s"
+ws_idle_timeout = "5m"
 
 [upstream]
 dial_timeout = "5s"
+max_idle_conns_per_host = 32
+idle_timeout = "90s"
 insecure_skip_verify = false
+
+[mitm]
+# Pre-generación de certificados al arrancar para los dominios CDN/Populares más habituales
+prewarm_hosts = [
+  "www.google.com",
+  "www.gstatic.com",
+  "www.cloudflare.com",
+  "1.1.1.1",
+  "chatgpt.com",
+  "github.com"
+]
 
 [logging]
 log_bodies = true
-max_capture_bytes = 1048576
+# 8 MiB de límite de captura para cuerpos de datos
+max_capture_bytes = 8388608
 dump_dir = "dumps"
+dump_on_policy_hit = true
+# Clave criptográfica para enmascarar contraseñas/credenciales con hash HMAC-SHA256 en logs forenses
+audit_key = "clave-secreta-de-auditoria-lucidgate"
+dump_credentials_cleartext = false
+
+[metrics]
+# Expone la monitorización con el servidor administrativo en localhost
+enabled = true
+listen_addr = "127.0.0.1:6060"
 
 [rules]
+# Carpeta que almacena las listas de filtrado estructuradas estilo e2guardian
 include_dir = ["rules.d"]
 
 [[access.profile]]
 name = "admin"
 default = true
-clients =["127.0.0.1/32"]
+clients = ["0.0.0.0/0"]
+
+[[schedule.window]]
+profile = "admin"
+days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+start = "00:00"
+end = "24:00"
 
 [semantic]
-blocked_phrases = ["monja", "conejo"]
+# Bloqueo inmediato de payload/palabras clave e2guardian
+blocked_phrases = ["payload-malicioso-bloqueado-trie", "monja", "conejo"]
 score_threshold = 100
 
 [[semantic.weighted_phrase]]
@@ -31,29 +66,39 @@ phrase = "malware"
 weight = 60
 
 [[semantic.weighted_phrase]]
-phrase = "payload"
-weight = 50
+phrase = "credential dump"
+weight = 80
+
+[[semantic.weighted_phrase]]
+phrase = "exploit kit"
+weight = 60
 
 [masking]
-phrases = ["apikey-12345"]
+# Censura textos sensibles (como API Keys o tokens) de forma automática con asteriscos
+phrases = ["apikey-secreta-super-oculta-de-produccion"]
 
 [injection]
-# html_banner = "<div style=\"position:fixed;top:0;width:100%;background:red;color:white;text-align:center;z-index:9999\">LUCIDGATE INTERCEPTADO</div>"
+# Inyección dinámica de un banner HTML justo antes del tag </body> en páginas no seguras
+html_banner = "<div style=\"position:fixed;bottom:0;left:0;right:0;background:#ef4444;color:white;text-align:center;padding:8px;z-index:99999;font-family:sans-serif;font-weight:bold;\">🛡️ LucidGate: Tráfico Interceptado e Inspeccionado Activado</div>"
 
 [magic]
-blocked_types =["executable/pe", "executable/elf"]
+# Bloqueo instantáneo por cabecera MIME "magic number" de ejecutables antes de transmitirse
+blocked_types = ["executable/pe", "executable/elf"]
 
 [antivirus]
+# Configuración del escáner en streaming de ClamAV (desactivado por defecto)
 enabled = false
 clamav_addr = "127.0.0.1:3310"
 temp_dir = "/tmp"
 trickle_interval = "1s"
 scan_timeout = "30s"
 
-[[substitution.rule]]
-search = "Europa"
-replace = "América"
-
+[substitution]
+# Reglas de sustitución directa de texto en flujos mutables
 [[substitution.rule]]
 search = "Real Madrid"
 replace = "Súper Real Madrid"
+
+[[substitution.rule]]
+search = "http://example.com"
+replace = "https://example.com"

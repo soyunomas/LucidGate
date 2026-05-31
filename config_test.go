@@ -2,11 +2,16 @@ package main
 
 import (
 	"bytes"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"lucidgate/proxy"
 )
 
 func TestParseConfigDefaults(t *testing.T) {
@@ -27,11 +32,23 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.IOTimeout != 30*time.Second {
 		t.Fatalf("IOTimeout = %s", cfg.IOTimeout)
 	}
+	if cfg.WSIdleTimeout != 5*time.Minute {
+		t.Fatalf("WSIdleTimeout = %s", cfg.WSIdleTimeout)
+	}
 	if cfg.DialTimeout != 10*time.Second {
 		t.Fatalf("DialTimeout = %s", cfg.DialTimeout)
 	}
+	if cfg.UpstreamMaxIdlePerHost != 32 || cfg.UpstreamIdleTimeout != 90*time.Second {
+		t.Fatalf("upstream pool = %d/%s", cfg.UpstreamMaxIdlePerHost, cfg.UpstreamIdleTimeout)
+	}
 	if cfg.HandshakeTimeout != 5*time.Second {
 		t.Fatalf("HandshakeTimeout = %s", cfg.HandshakeTimeout)
+	}
+	if cfg.WaitTimeout != 250*time.Millisecond {
+		t.Fatalf("WaitTimeout = %s", cfg.WaitTimeout)
+	}
+	if cfg.CertWorkers != runtime.NumCPU() {
+		t.Fatalf("CertWorkers = %d", cfg.CertWorkers)
 	}
 	if !cfg.LogBodies {
 		t.Fatal("LogBodies = false, want true")
@@ -42,22 +59,33 @@ func TestParseConfigDefaults(t *testing.T) {
 	if cfg.UpstreamInsecure {
 		t.Fatal("UpstreamInsecure = true, want false")
 	}
+	if cfg.ReusePort {
+		t.Fatal("ReusePort = true, want false")
+	}
 }
 
 func TestParseConfigEnvAndFlags(t *testing.T) {
 	t.Chdir(t.TempDir())
 	env := map[string]string{
-		"CLEARGATE_LISTEN_ADDR":                   "127.0.0.1:9000",
-		"CLEARGATE_CERT_DIR":                      "/tmp/ca",
-		"CLEARGATE_MAX_CONNECTIONS":               "16",
-		"CLEARGATE_IO_TIMEOUT":                    "11s",
-		"CLEARGATE_DIAL_TIMEOUT":                  "3s",
-		"CLEARGATE_HANDSHAKE_TIMEOUT":             "4s",
-		"CLEARGATE_LOG_BODIES":                    "false",
-		"CLEARGATE_MAX_CAPTURE_BYTES":             "128",
-		"CLEARGATE_UPSTREAM_INSECURE_SKIP_VERIFY": "true",
+		"CLEARGATE_LISTEN_ADDR":                      "127.0.0.1:9000",
+		"CLEARGATE_CERT_DIR":                         "/tmp/ca",
+		"CLEARGATE_MAX_CONNECTIONS":                  "16",
+		"CLEARGATE_IO_TIMEOUT":                       "11s",
+		"LUCIDGATE_WS_IDLE_TIMEOUT":                  "2m",
+		"CLEARGATE_DIAL_TIMEOUT":                     "3s",
+		"CLEARGATE_UPSTREAM_MAX_IDLE_CONNS_PER_HOST": "12",
+		"CLEARGATE_UPSTREAM_IDLE_TIMEOUT":            "45s",
+		"CLEARGATE_HANDSHAKE_TIMEOUT":                "4s",
+		"CLEARGATE_WAIT_TIMEOUT":                     "500ms",
+		"CLEARGATE_CERT_WORKERS":                     "8",
+		"CLEARGATE_LOG_BODIES":                       "false",
+		"CLEARGATE_MAX_CAPTURE_BYTES":                "128",
+		"CLEARGATE_UPSTREAM_INSECURE_SKIP_VERIFY":    "true",
+		"CLEARGATE_METRICS_ENABLED":                  "true",
+		"CLEARGATE_METRICS_LISTEN_ADDR":              "127.0.0.1:9100",
+		"LUCIDGATE_REUSEPORT":                        "true",
 	}
-	cfg, err := parseConfig([]string{"--listen", "127.0.0.1:9999", "--max-capture-bytes", "256"}, func(key string) string {
+	cfg, err := parseConfig([]string{"--listen", "127.0.0.1:9999", "--max-capture-bytes", "256", "--wait-timeout", "400ms", "--cert-workers", "6", "--ws-idle-timeout", "90s", "--mitm-prewarm-hosts", "Flagged.Example:443, https://Other.test/path"}, func(key string) string {
 		return env[key]
 	}, &bytes.Buffer{})
 	if err != nil {
@@ -72,8 +100,23 @@ func TestParseConfigEnvAndFlags(t *testing.T) {
 	if cfg.MaxConnections != 16 || cfg.IOTimeout != 11*time.Second {
 		t.Fatalf("network = %d/%s", cfg.MaxConnections, cfg.IOTimeout)
 	}
+	if cfg.WSIdleTimeout != 90*time.Second {
+		t.Fatalf("WSIdleTimeout = %s", cfg.WSIdleTimeout)
+	}
 	if cfg.DialTimeout != 3*time.Second || cfg.HandshakeTimeout != 4*time.Second {
 		t.Fatalf("timeouts = %s/%s", cfg.DialTimeout, cfg.HandshakeTimeout)
+	}
+	if cfg.UpstreamMaxIdlePerHost != 12 || cfg.UpstreamIdleTimeout != 45*time.Second {
+		t.Fatalf("upstream pool = %d/%s", cfg.UpstreamMaxIdlePerHost, cfg.UpstreamIdleTimeout)
+	}
+	if cfg.WaitTimeout != 400*time.Millisecond {
+		t.Fatalf("WaitTimeout = %s", cfg.WaitTimeout)
+	}
+	if cfg.CertWorkers != 6 {
+		t.Fatalf("CertWorkers = %d, want 6", cfg.CertWorkers)
+	}
+	if got, want := strings.Join(cfg.MITMPrewarmHosts, ","), "flagged.example,other.test"; got != want {
+		t.Fatalf("MITMPrewarmHosts = %q, want %q", got, want)
 	}
 	if cfg.LogBodies {
 		t.Fatal("LogBodies = true, want false")
@@ -83,6 +126,12 @@ func TestParseConfigEnvAndFlags(t *testing.T) {
 	}
 	if !cfg.UpstreamInsecure {
 		t.Fatal("UpstreamInsecure = false, want true")
+	}
+	if !cfg.MetricsEnabled || cfg.MetricsListenAddr != "127.0.0.1:9100" {
+		t.Fatalf("metrics = enabled:%t addr:%q", cfg.MetricsEnabled, cfg.MetricsListenAddr)
+	}
+	if !cfg.ReusePort {
+		t.Fatal("ReusePort = false, want true")
 	}
 }
 
@@ -96,15 +145,25 @@ cert_dir = "/var/lib/lucidgate/certs"
 handshake_timeout = "7s"
 max_connections = 32
 io_timeout = "12s"
+ws_idle_timeout = "3m"
 
 [upstream]
 dial_timeout = "8s"
+max_idle_conns_per_host = 24
+idle_timeout = "75s"
 insecure_skip_verify = true
+
+[mitm]
+prewarm_hosts = ["WWW.Google.COM:443", "https://www.gstatic.com/generate_204", "www.google.com"]
 
 [logging]
 log_bodies = false
 max_capture_bytes = 4096
 dump_dir = "/tmp/lucidgate-dumps"
+
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1:6061"
 
 [rules]
 include_dir = ["rules.d", "profiles.d"]
@@ -156,7 +215,8 @@ scan_timeout = "15s"
 		t.Fatalf("WriteFile() error = %v", err)
 	}
 	env := map[string]string{
-		"LUCIDGATE_DIAL_TIMEOUT": "9s",
+		"LUCIDGATE_DIAL_TIMEOUT":    "9s",
+		"LUCIDGATE_WS_IDLE_TIMEOUT": "4m",
 	}
 	cfg, err := parseConfig([]string{"--config", path, "--listen", "127.0.0.1:7443"}, func(key string) string {
 		return env[key]
@@ -176,14 +236,26 @@ scan_timeout = "15s"
 	if cfg.MaxConnections != 32 || cfg.IOTimeout != 12*time.Second {
 		t.Fatalf("network = %d/%s", cfg.MaxConnections, cfg.IOTimeout)
 	}
+	if cfg.WSIdleTimeout != 4*time.Minute {
+		t.Fatalf("WSIdleTimeout = %s", cfg.WSIdleTimeout)
+	}
 	if cfg.DialTimeout != 9*time.Second || cfg.HandshakeTimeout != 7*time.Second {
 		t.Fatalf("timeouts = %s/%s", cfg.DialTimeout, cfg.HandshakeTimeout)
+	}
+	if cfg.UpstreamMaxIdlePerHost != 24 || cfg.UpstreamIdleTimeout != 75*time.Second {
+		t.Fatalf("upstream pool = %d/%s", cfg.UpstreamMaxIdlePerHost, cfg.UpstreamIdleTimeout)
+	}
+	if got, want := strings.Join(cfg.MITMPrewarmHosts, ","), "www.google.com,www.gstatic.com"; got != want {
+		t.Fatalf("MITMPrewarmHosts = %q, want %q", got, want)
 	}
 	if cfg.LogBodies {
 		t.Fatal("LogBodies = true, want false")
 	}
 	if cfg.MaxCaptureBytes != 4096 || cfg.DumpDir != "/tmp/lucidgate-dumps" {
 		t.Fatalf("logging = %d/%q", cfg.MaxCaptureBytes, cfg.DumpDir)
+	}
+	if !cfg.MetricsEnabled || cfg.MetricsListenAddr != "127.0.0.1:6061" {
+		t.Fatalf("metrics = enabled:%t addr:%q", cfg.MetricsEnabled, cfg.MetricsListenAddr)
 	}
 	if !cfg.UpstreamInsecure {
 		t.Fatal("UpstreamInsecure = false, want true")
@@ -248,6 +320,23 @@ enabled = true
 	}
 }
 
+func TestParseConfigRejectsEnabledMetricsWithoutListenAddr(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lucidgate.toml")
+	err := os.WriteFile(path, []byte(`
+[metrics]
+enabled = true
+listen_addr = ""
+`), 0o600)
+	if err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	_, err = parseConfig([]string{"--config", path}, emptyEnv, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "metrics listen address") {
+		t.Fatalf("parseConfig() error = %v, want missing metrics listen address", err)
+	}
+}
+
 func TestLoadRuleDomainsFromIncludeDirs(t *testing.T) {
 	dir := t.TempDir()
 	rulesDir := filepath.Join(dir, "rules.d")
@@ -282,10 +371,162 @@ Example.COM
 	}
 }
 
+func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "bannedsitelist"), "blocked.test\nlegacy-block.test\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionsitelist"), "allowed.blocked.test\n")
+	writeFile(t, filepath.Join(listsDir, "bannedregexpsitelist"), `(^|\.)regex-blocked\.test$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionregexpsitelist"), `^allowed\.regex-blocked\.test$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "bannedurllist"), "http://example.test/private\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionurllist"), "http://example.test/private/allowed\n")
+	writeFile(t, filepath.Join(listsDir, "bannedregexpurllist"), `/blocked-by-regex($|\?)`+"\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionregexpurllist"), `/blocked-by-regex\?token=ok$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "bannedextensionlist"), ".exe\nzip\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionextensionlist"), ".ok\n")
+	writeFile(t, filepath.Join(listsDir, "bannedmimetypelist"), "application/x-msdownload\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionmimetypelist"), "application/signed-exchange\n")
+	writeFile(t, filepath.Join(listsDir, "bannedfilenamelist"), "secret.bin\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionfilenamelist"), "allowed.zip\n")
+	writeFile(t, filepath.Join(listsDir, "bannedheaderlist"), "x-tracker: blocked\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionheaderlist"), "x-tracker: allowed\n")
+	writeFile(t, filepath.Join(listsDir, "bannedcookiephraselist"), "trackid=\n")
+	writeFile(t, filepath.Join(listsDir, "exceptioncookiephraselist"), "trackid=allowed\n")
+	writeFile(t, filepath.Join(listsDir, "custom-legacy-domains"), "legacy.test\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	policyConfig, err := loadRulePolicy(cfg)
+	if err != nil {
+		t.Fatalf("loadRulePolicy() error = %v", err)
+	}
+	policy, err := proxy.NewPolicy(policyConfig)
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	checkReq := func(target string) *http.Request {
+		req := httptest.NewRequest(http.MethodGet, target, nil)
+		req.RemoteAddr = "127.0.0.1:50000"
+		return req
+	}
+	if decision := policy.Evaluate("sub.blocked.test", nil, "http"); !decision.Blocked {
+		t.Fatalf("blocked domain decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("allowed.blocked.test", nil, "http"); decision.Blocked {
+		t.Fatalf("exception domain decision = %#v, want allowed", decision)
+	}
+	if decision := policy.Evaluate("www.regex-blocked.test", nil, "http"); !decision.Blocked {
+		t.Fatalf("regex domain decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("allowed.regex-blocked.test", nil, "http"); decision.Blocked {
+		t.Fatalf("regex exception domain decision = %#v, want allowed", decision)
+	}
+	if decision := policy.Evaluate("legacy.test", nil, "http"); !decision.Blocked {
+		t.Fatalf("legacy domain decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("example.test", checkReq("http://example.test/private/report?q=1"), "http"); !decision.Blocked {
+		t.Fatalf("blocked URL decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("example.test", checkReq("http://example.test/private/allowed/report"), "http"); decision.Blocked {
+		t.Fatalf("exception URL decision = %#v, want allowed", decision)
+	}
+	if decision := policy.Evaluate("example.test", checkReq("http://example.test/blocked-by-regex?x=1"), "http"); !decision.Blocked {
+		t.Fatalf("regex URL decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("example.test", checkReq("http://example.test/blocked-by-regex?token=ok"), "http"); decision.Blocked {
+		t.Fatalf("regex exception URL decision = %#v, want allowed", decision)
+	}
+	if decision := policy.EvaluateRequest("example.test", checkReq("http://example.test/download/tool.exe"), "http"); !decision.Blocked || decision.MatchType != "extension" {
+		t.Fatalf("extension decision = %#v, want blocked", decision)
+	}
+	if decision := policy.EvaluateRequest("example.test", checkReq("http://example.test/download/allowed.zip"), "http"); decision.Blocked {
+		t.Fatalf("filename exception decision = %#v, want allowed", decision)
+	}
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Request:    checkReq("http://example.test/download/file"),
+	}
+	resp.Header.Set("Content-Type", "application/x-msdownload")
+	if decision := policy.EvaluateResponse(resp, "http"); !decision.Blocked || decision.MatchType != "mime" {
+		t.Fatalf("MIME decision = %#v, want blocked", decision)
+	}
+	resp.Header.Set("Content-Type", "application/octet-stream")
+	resp.Header.Set("Content-Disposition", `attachment; filename="secret.bin"`)
+	if decision := policy.EvaluateResponse(resp, "http"); !decision.Blocked || decision.MatchType != "filename" {
+		t.Fatalf("filename decision = %#v, want blocked", decision)
+	}
+	headerReq := checkReq("http://example.test/")
+	headerReq.Header.Set("X-Tracker", "blocked")
+	if decision := policy.EvaluateRequest("example.test", headerReq, "http"); !decision.Blocked || decision.MatchType != "header" {
+		t.Fatalf("header decision = %#v, want blocked", decision)
+	}
+	headerReq.Header.Set("X-Tracker", "allowed")
+	if decision := policy.EvaluateRequest("example.test", headerReq, "http"); decision.Blocked {
+		t.Fatalf("header exception decision = %#v, want allowed", decision)
+	}
+	cookieReq := checkReq("http://example.test/")
+	cookieReq.Header.Set("Cookie", "trackid=bad")
+	if decision := policy.EvaluateRequest("example.test", cookieReq, "http"); !decision.Blocked || decision.MatchType != "cookie" {
+		t.Fatalf("cookie decision = %#v, want blocked", decision)
+	}
+}
+
+func TestApplyRuntimeConfigRejectsInvalidPolicyRegexWithFileLine(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "lists", "bannedregexpurllist"), "ok\n[\n")
+	cfg := appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	err := applyRuntimeConfig(server, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "bannedregexpurllist:2") {
+		t.Fatalf("applyRuntimeConfig() error = %v, want file:line regex error", err)
+	}
+}
+
+func TestApplyRuntimeConfigRejectsInvalidSubstitutionRegex(t *testing.T) {
+	cfg := appConfig{
+		RegexSubstitutions: []RegexSubstitutionConfig{
+			{Pattern: `[`, Replace: "x", Source: "regex-sub.list:2"},
+		},
+	}
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	err := applyRuntimeConfig(server, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "regex-sub.list:2") {
+		t.Fatalf("applyRuntimeConfig() error = %v, want source regex error", err)
+	}
+}
+
+func TestApplyRuntimeConfigPublishesWSIdleTimeout(t *testing.T) {
+	cfg := appConfig{
+		IOTimeout:        time.Second,
+		WSIdleTimeout:    2 * time.Minute,
+		MaxCaptureBytes:  1 << 20,
+		AntivirusTimeout: 30 * time.Second,
+	}
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	if err := applyRuntimeConfig(server, &cfg); err != nil {
+		t.Fatalf("applyRuntimeConfig() error = %v", err)
+	}
+	opts := server.RelayOptions()
+	if opts.WSIdleTimeout != 2*time.Minute {
+		t.Fatalf("RelayOptions.WSIdleTimeout = %s, want 2m", opts.WSIdleTimeout)
+	}
+}
+
 func TestParseConfigRejectsInvalidValues(t *testing.T) {
 	_, err := parseConfig([]string{"--max-capture-bytes", "-1"}, emptyEnv, &bytes.Buffer{})
 	if err == nil {
 		t.Fatal("parseConfig() error = nil, want validation error")
+	}
+	_, err = parseConfig([]string{"--ws-idle-timeout", "0"}, emptyEnv, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "ws idle timeout") {
+		t.Fatalf("parseConfig() error = %v, want ws idle timeout validation error", err)
 	}
 }
 
@@ -326,6 +567,192 @@ weight = -1
 	}
 }
 
+func TestLoadRulePolicyRecognizesE2GuardianPhraseLists(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "bannedphraselist"), "credential dump\nmalware kit\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionphraselist"), "malware research\n")
+	writeFile(t, filepath.Join(listsDir, "weightedphraselist"), "<phishing><60>\n<scam><40>\n")
+	writeFile(t, filepath.Join(listsDir, "weightedphraseexceptions"), "<scam><40>\n")
+
+	cfg := &appConfig{
+		ConfigPath:        filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs:       []string{"lists"},
+		SemanticThreshold: 100,
+	}
+	if _, err := loadRulePolicy(cfg); err != nil {
+		t.Fatalf("loadRulePolicy() error = %v", err)
+	}
+	if got, want := cfg.SemanticPhrases, []string{"credential dump", "malware kit"}; !equalStrings(got, want) {
+		t.Fatalf("SemanticPhrases = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.SemanticExceptionPhrases, []string{"malware research"}; !equalStrings(got, want) {
+		t.Fatalf("SemanticExceptionPhrases = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.SemanticWeighted, []SemanticPhraseConfig{{Phrase: "phishing", Weight: 60}, {Phrase: "scam", Weight: 40}}; !equalWeighted(got, want) {
+		t.Fatalf("SemanticWeighted = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.SemanticWeightedExceptions, []SemanticPhraseConfig{{Phrase: "scam", Weight: 40}}; !equalWeighted(got, want) {
+		t.Fatalf("SemanticWeightedExceptions = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadRulePolicyReportsWeightedPhraseParseErrorWithLineInfo(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "weightedphraselist"), "<ok><10>\nbroken-line\n")
+
+	cfg := &appConfig{
+		ConfigPath:        filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs:       []string{"lists"},
+		SemanticThreshold: 50,
+	}
+	_, err := loadRulePolicy(cfg)
+	if err == nil {
+		t.Fatal("loadRulePolicy() error = nil, want parse error")
+	}
+	if !strings.Contains(err.Error(), "weightedphraselist:2") {
+		t.Fatalf("error = %v, want file:line context", err)
+	}
+}
+
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalWeighted(a, b []SemanticPhraseConfig) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func emptyEnv(string) string {
 	return ""
+}
+
+func TestParseConfigRejectsCleartextWithoutPolicyHit(t *testing.T) {
+	cfg := appConfig{
+		ListenAddr:               "127.0.0.1:8080",
+		CertDir:                  "certs",
+		MaxConnections:           10,
+		IOTimeout:                time.Second,
+		WSIdleTimeout:            time.Second,
+		DialTimeout:              time.Second,
+		HandshakeTimeout:         time.Second,
+		DumpCredentialsCleartext: true,
+		DumpOnPolicyHit:          false,
+	}
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("expected validation error when dump_credentials_cleartext=true and dump_on_policy_hit=false")
+	}
+	if !strings.Contains(err.Error(), "dump_credentials_cleartext=true requires dump_on_policy_hit=true") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+func TestLoadRulePolicyDownloadManager(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+
+	// Create valid downloadmanager file
+	validRules := `
+# some comment
+banned ext exe
+banned mime application/zip
+exception ext dmg
+exception mime application/x-shockwave-flash
+`
+	writeFile(t, filepath.Join(listsDir, "downloadmanager"), validRules)
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	policyConfig, err := loadRulePolicy(cfg)
+	if err != nil {
+		t.Fatalf("loadRulePolicy() error = %v", err)
+	}
+
+	// Validate parsed fields
+	if !equalStrings(policyConfig.Files.BannedExtensions, []string{"exe"}) {
+		t.Errorf("BannedExtensions = %v, want [exe]", policyConfig.Files.BannedExtensions)
+	}
+	if !equalStrings(policyConfig.Files.BannedMIMEs, []string{"application/zip"}) {
+		t.Errorf("BannedMIMEs = %v, want [application/zip]", policyConfig.Files.BannedMIMEs)
+	}
+	if !equalStrings(policyConfig.Files.ExceptionExtensions, []string{"dmg"}) {
+		t.Errorf("ExceptionExtensions = %v, want [dmg]", policyConfig.Files.ExceptionExtensions)
+	}
+	if !equalStrings(policyConfig.Files.ExceptionMIMEs, []string{"application/x-shockwave-flash"}) {
+		t.Errorf("ExceptionMIMEs = %v, want [application/x-shockwave-flash]", policyConfig.Files.ExceptionMIMEs)
+	}
+
+	// Test malformed actions
+	t.Run("invalid action", func(t *testing.T) {
+		badDir := t.TempDir()
+		badListsDir := filepath.Join(badDir, "lists")
+		writeFile(t, filepath.Join(badListsDir, "downloadmanager"), "unknown ext zip\n")
+		badCfg := &appConfig{
+			ConfigPath:  filepath.Join(badDir, "lucidgate.toml"),
+			IncludeDirs: []string{"lists"},
+		}
+		_, err := loadRulePolicy(badCfg)
+		if err == nil {
+			t.Fatal("expected error with invalid action")
+		}
+		if !strings.Contains(err.Error(), "unsupported downloadmanager action \"unknown\"") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// Test malformed rule type
+	t.Run("invalid rule type", func(t *testing.T) {
+		badDir := t.TempDir()
+		badListsDir := filepath.Join(badDir, "lists")
+		writeFile(t, filepath.Join(badListsDir, "downloadmanager"), "banned type zip\n")
+		badCfg := &appConfig{
+			ConfigPath:  filepath.Join(badDir, "lucidgate.toml"),
+			IncludeDirs: []string{"lists"},
+		}
+		_, err := loadRulePolicy(badCfg)
+		if err == nil {
+			t.Fatal("expected error with invalid rule type")
+		}
+		if !strings.Contains(err.Error(), "unsupported downloadmanager rule type \"type\"") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	// Test wrong token count
+	t.Run("wrong token count", func(t *testing.T) {
+		badDir := t.TempDir()
+		badListsDir := filepath.Join(badDir, "lists")
+		writeFile(t, filepath.Join(badListsDir, "downloadmanager"), "banned ext\n")
+		badCfg := &appConfig{
+			ConfigPath:  filepath.Join(badDir, "lucidgate.toml"),
+			IncludeDirs: []string{"lists"},
+		}
+		_, err := loadRulePolicy(badCfg)
+		if err == nil {
+			t.Fatal("expected error with wrong token count")
+		}
+		if !strings.Contains(err.Error(), "invalid downloadmanager rule \"banned ext\" (expected: [banned|exception] [ext|mime] [value])") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
 }

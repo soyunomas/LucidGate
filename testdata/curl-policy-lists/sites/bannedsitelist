@@ -1,0 +1,3 @@
+# Blocks before upstream dial. Curl can test this without DNS because the
+# explicit proxy receives the absolute HTTP URL.
+blocked.local

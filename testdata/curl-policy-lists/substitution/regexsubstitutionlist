@@ -1,0 +1,2 @@
+ca.*sa\.png => carcasa.png
+image-([0-9]+)\.png => asset-$1.webp

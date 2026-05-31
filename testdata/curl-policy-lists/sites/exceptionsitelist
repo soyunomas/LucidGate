@@ -1,0 +1,2 @@
+# Keeps normal local upstream traffic allowed if broader domain tests are added.
+127.0.0.1

@@ -29,6 +29,7 @@ Use it only on systems and traffic you own or are explicitly authorized to inspe
 - Streaming textual upload inspection for `POST`, `PUT`, and `PATCH`.
 - Bypass for binary, multipart, request-compressed, and unsupported response-compressed payloads.
 - Optional bounded JSONL body dump for offline analysis.
+- External e2guardian-style phrase, masking, and substitution lists with `.Include<...>` recursion and per-file/line error reporting.
 
 ## Security Notes
 
@@ -101,18 +102,30 @@ cert_dir = "certs"
 handshake_timeout = "5s"
 max_connections = 1024
 io_timeout = "30s"
+ws_idle_timeout = "5m"
 
 [upstream]
 dial_timeout = "10s"
+max_idle_conns_per_host = 32
+idle_timeout = "90s"
 insecure_skip_verify = false
+
+[mitm]
+prewarm_hosts = ["www.google.com", "www.gstatic.com"]
 
 [logging]
 log_bodies = true
 max_capture_bytes = 1048576
 dump_dir = ""
 
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1:6060"
+
 [rules]
-include_dir = ["rules.d"]
+# Plain domain blocklists. Directories or single files are accepted; entries
+# are read in alphabetical order. Lines starting with '#' are comments.
+include_dir = ["rules.d", "lists/sites"]
 
 [[access.profile]]
 name = "default"
@@ -128,6 +141,11 @@ end = "24:00"
 [semantic]
 blocked_phrases = ["blocked phrase"]
 score_threshold = 100
+# External e2guardian-style lists. Embedded entries above are merged with
+# the contents of these files. See "External Phrase Lists" below.
+blocked_phrase_lists   = ["lists/phraselists/bannedphraselist"]
+weighted_phrase_lists  = ["lists/phraselists/weightedphraselist"]
+exception_phrase_lists = ["lists/phraselists/exceptionphraselist"]
 
 [[semantic.weighted_phrase]]
 phrase = "malware"
@@ -138,7 +156,11 @@ phrase = "credential dump"
 weight = 80
 
 [masking]
-phrases = ["secret token"]
+phrases      = ["secret token"]
+phrase_lists = ["lists/masking/maskedphraselist"]
+
+[substitution]
+rule_lists = ["lists/substitution/substitutionlist"]
 
 [[substitution.rule]]
 search = "internal codename"
@@ -157,29 +179,263 @@ html_banner = "<div style=\"position:fixed;left:0;right:0;bottom:0;z-index:21474
 | `--cert-dir` | `LUCIDGATE_CERT_DIR` | `certs` | Directory for `ca.crt` and `ca.key`. |
 | `--max-connections` | `LUCIDGATE_MAX_CONNECTIONS` | `1024` | Maximum concurrent CONNECT tunnels. |
 | `--io-timeout` | `LUCIDGATE_IO_TIMEOUT` | `30s` | Per-operation relay read/write timeout. |
+| `--ws-idle-timeout` | `LUCIDGATE_WS_IDLE_TIMEOUT` | `5m` | Per-direction idle timeout for raw WebSocket sessions after a successful Upgrade. |
 | `--dial-timeout` | `LUCIDGATE_DIAL_TIMEOUT` | `10s` | Upstream TCP/uTLS dial timeout. |
+| `--upstream-max-idle-conns-per-host` | `LUCIDGATE_UPSTREAM_MAX_IDLE_CONNS_PER_HOST` | `32` | Maximum idle upstream keep-alive connections per destination; `0` disables pooling. |
+| `--upstream-idle-timeout` | `LUCIDGATE_UPSTREAM_IDLE_TIMEOUT` | `90s` | Maximum time an idle upstream keep-alive connection stays pooled. |
 | `--handshake-timeout` | `LUCIDGATE_HANDSHAKE_TIMEOUT` | `5s` | Browser-side TLS handshake timeout. |
+| `--mitm-prewarm-hosts` | `LUCIDGATE_MITM_PREWARM_HOSTS` | empty | Comma-separated popular hostnames to pre-generate MITM leaf certificates for. |
 | `--log-bodies` | `LUCIDGATE_LOG_BODIES` | `true` | Enable byte-count body capture behavior. |
 | `--max-capture-bytes` | `LUCIDGATE_MAX_CAPTURE_BYTES` | `1048576` | Maximum bytes captured per body; `0` disables capture. |
 | `--dump-dir` | `LUCIDGATE_DUMP_DIR` | empty | Write bounded JSONL cleartext dumps when non-empty. |
+| `--dump-on-policy-hit` | `LUCIDGATE_DUMP_ON_POLICY_HIT` | `false` | If true, only write body dumps to `dump-dir` when a policy blocks or matches audit logs. |
+| `--dump-credentials-cleartext` | `LUCIDGATE_DUMP_CREDENTIALS_CLEARTEXT` | `false` | Enable cleartext credentials dumping (authorized environments only, requires `dump_on_policy_hit=true`). |
+| `--audit-key` | `LUCIDGATE_AUDIT_KEY` | empty | Secret key for cryptographically hashing sensitive credentials (HMAC-SHA256) for forensic correlation. |
 | `--upstream-insecure-skip-verify` | `LUCIDGATE_UPSTREAM_INSECURE_SKIP_VERIFY` | `false` | Skip upstream TLS verification. Lab/smoke only. |
 | `--version` | none | `false` | Print version and exit. |
 
+## Observability
+
+The admin server is loopback-only by default. `pprof` is always mounted under `127.0.0.1:6060/debug/pprof/`; Prometheus metrics are mounted at `/metrics` when enabled:
+
+```toml
+[metrics]
+enabled = true
+listen_addr = "127.0.0.1:6060"
+```
+
+```bash
+curl http://127.0.0.1:6060/metrics
+```
+
+Useful LucidGate metrics:
+
+- `lucidgate_active_connections`
+- `lucidgate_bytes_total{direction="in|out"}`
+- `lucidgate_cert_cache_requests_total`
+- `lucidgate_cert_cache_hits_total`
+- `lucidgate_rule_hits_total`
+- `lucidgate_inspection_duration_seconds`
+- `lucidgate_tls_handshake_duration_seconds{direction="downstream"}`
+- `lucidgate_alt_svc_stripped_total`
+- `lucidgate_websocket_sessions_total{result="opened|denied|error|upstream_refused"}`
+- `lucidgate_websocket_bytes_total{direction="in|out"}`
+
+The Prometheus Go/process collectors are also available from the same endpoint. Use `go_goroutines`, `process_open_fds`, and `process_max_fds` while running connection-load tests.
+
 ## Rule Lists
 
-`rules.include_dir` loads plain text domain lists. Each non-empty, non-comment line blocks that domain and all subdomains.
+`rules.include_dir` loads LucidGate/e2guardian-style rule files. Unknown file names keep the legacy behavior: each non-empty, non-comment line is treated as a blocked domain and applies to that domain plus all subdomains.
 
 ```text
 example.com
 school.test
 ```
 
+Each entry in `include_dir` may be a directory (every regular file inside is read in alphabetical order) or a single file. Relative paths resolve against the directory holding `lucidgate.toml`. Lines starting with `#` are comments and blank lines are ignored.
+
 Example:
 
 ```toml
 [rules]
-include_dir = ["rules.d", "profiles.d"]
+include_dir = ["rules.d", "profiles.d", "lists/sites"]
 ```
+
+Recognized e2guardian-style site and URL files:
+
+- `bannedsitelist`: blocked domains, compiled into the reverse domain trie.
+- `exceptionsitelist`: allowed domain overrides.
+- `bannedregexpsitelist`: blocked domain regexes.
+- `exceptionregexpsitelist`: allowed domain regex overrides.
+- `bannedurllist`: blocked canonical URLs (`scheme://host/path?query`).
+- `exceptionurllist`: allowed URL overrides.
+- `bannedregexpurllist`: blocked URL regexes.
+- `exceptionregexpurllist`: allowed URL regex overrides.
+- `bannedextensionlist`: blocked download/request path extensions such as `.exe` or `zip`.
+- `exceptionextensionlist`: allowed extension overrides.
+- `bannedmimetypelist`: blocked response MIME types such as `application/x-msdownload`; `type/*` wildcards are supported.
+- `exceptionmimetypelist`: allowed MIME overrides.
+- `bannedfilenamelist`: blocked basename matches from URL path or `Content-Disposition`.
+- `exceptionfilenamelist`: allowed filename overrides.
+- `bannedheaderlist`: blocked request/response header phrases matched against `Header-Name: value`.
+- `exceptionheaderlist`: allowed header phrase overrides.
+- `bannedcookiephraselist`: blocked cookie phrases matched against `Cookie` and `Set-Cookie` values.
+- `exceptioncookiephraselist`: allowed cookie phrase overrides.
+- `bannedclientiplist`: blocked client IP addresses or CIDR prefixes.
+- `exceptionclientiplist`: allowed client IP or CIDR overrides.
+- `e2guardianipgroups`: mapping of client IPs/CIDRs to profile groups (syntax: `IP/CIDR = group`).
+- `filtergroupslist`: list of group/profile names to assign numeric indices.
+- `logurllist`: URLs to explicitly mark for auditing/logging.
+- `exceptionlogurllist`: URL audit logging exclusions.
+- `logregexpurllist`: URL regular expressions to mark for auditing.
+- `exceptionlogregexpurllist`: URL regex audit logging exclusions.
+- `logregexpsitelist`: domain regular expressions to mark for auditing.
+- `exceptionlogregexpsitelist`: domain regex audit logging exclusions.
+
+Precedence is explicit: exceptions win over bans. For domains, `example.com` and `.example.com` both match the root domain and subdomains. Regexes are compiled during startup/reload; an invalid regex aborts that reload with `file:line` in the error. HTTP requests are checked before upstream dial. HTTPS URL rules are checked after the local MITM TLS handshake, before opening the upstream connection for the decrypted request.
+
+File/download rules are checked twice. URL path filename and extension are checked before upstream dial when possible. Response `Content-Type` and `Content-Disposition` are checked after upstream headers arrive but before LucidGate transfers the body to the client.
+
+Header and cookie rules use case-insensitive substring matching. Request headers/cookies are checked before upstream traffic. Response headers and `Set-Cookie` are checked after upstream headers arrive but before response headers/body are delivered to the client.
+
+For external phrase, masking, and substitution lists (e2guardian style), see [External Phrase Lists](#external-phrase-lists-e2guardian-style) below.
+
+## Configuration Files By List Type
+
+LucidGate can keep long policies out of `lucidgate.toml` by loading named files from `rules.include_dir` and the dedicated `*_lists` settings. The recommended layout is:
+
+```text
+lists/
+  sites/
+    bannedsitelist
+    exceptionsitelist
+    bannedregexpsitelist
+    exceptionregexpsitelist
+    bannedurllist
+    exceptionurllist
+    bannedregexpurllist
+    exceptionregexpurllist
+  downloads/
+    bannedextensionlist
+    exceptionextensionlist
+    bannedmimetypelist
+    exceptionmimetypelist
+    bannedfilenamelist
+    exceptionfilenamelist
+  http/
+    bannedheaderlist
+    exceptionheaderlist
+    bannedcookiephraselist
+    exceptioncookiephraselist
+  phraselists/
+    bannedphraselist
+    weightedphraselist
+    exceptionphraselist
+    weightedphraseexceptions
+  masking/
+    maskedphraselist
+  substitution/
+    substitutionlist
+    regexsubstitutionlist
+  clients/
+    bannedclientiplist
+    exceptionclientiplist
+    e2guardianipgroups
+    filtergroupslist
+  logging/
+    logurllist
+    exceptionlogurllist
+    logregexpurllist
+    exceptionlogregexpurllist
+    logregexpsitelist
+    exceptionlogregexpsitelist
+    logphraselist
+    exceptionlogphraselist
+```
+
+Wire policy lists through `rules.include_dir`:
+
+```toml
+[rules]
+include_dir = [
+  "lists/sites",
+  "lists/downloads",
+  "lists/http",
+]
+```
+
+Wire content lists through their feature sections:
+
+```toml
+[semantic]
+blocked_phrase_lists   = ["lists/phraselists/bannedphraselist"]
+weighted_phrase_lists  = ["lists/phraselists/weightedphraselist"]
+exception_phrase_lists = ["lists/phraselists/exceptionphraselist"]
+
+[masking]
+phrase_lists = ["lists/masking/maskedphraselist"]
+
+[substitution]
+rule_lists = ["lists/substitution/substitutionlist"]
+regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
+```
+
+| Family | File | Syntax | Evaluated |
+| --- | --- | --- | --- |
+| Domain | `bannedsitelist` | one domain per line | before upstream |
+| Domain | `exceptionsitelist` | one domain per line | overrides domain bans |
+| Domain | `bannedregexpsitelist` | Go/RE2 regex | before upstream |
+| Domain | `exceptionregexpsitelist` | Go/RE2 regex | overrides domain regex bans |
+| URL | `bannedurllist` | `scheme://host/path?query` prefix | before upstream when URL is known |
+| URL | `exceptionurllist` | URL prefix | overrides URL bans |
+| URL | `bannedregexpurllist` | Go/RE2 regex | before upstream when URL is known |
+| URL | `exceptionregexpurllist` | Go/RE2 regex | overrides URL regex bans |
+| Downloads | `bannedextensionlist` | `.exe` or `exe` | URL path before upstream |
+| Downloads | `exceptionextensionlist` | `.ok` or `ok` | overrides extension bans |
+| Downloads | `bannedmimetypelist` | `application/x-msdownload`, `type/*` | response headers before body |
+| Downloads | `exceptionmimetypelist` | MIME or `type/*` | overrides MIME bans |
+| Downloads | `bannedfilenamelist` | basename, e.g. `secret.bin` | URL path or `Content-Disposition` |
+| Downloads | `exceptionfilenamelist` | basename | overrides filename bans |
+| HTTP | `bannedheaderlist` | substring against `Header-Name: value` | request/response headers |
+| HTTP | `exceptionheaderlist` | substring | overrides header bans |
+| HTTP | `bannedcookiephraselist` | substring in `Cookie`/`Set-Cookie` | request/response cookies |
+| HTTP | `exceptioncookiephraselist` | substring | overrides cookie bans |
+| Semantic | `bannedphraselist` | one phrase per line | response/request body text stream |
+| Semantic | `weightedphraselist` | `<phrase><weight>` | response/request body scoring |
+| Semantic | `exceptionphraselist` | one phrase per line | suppresses subsequent hard/score blocks in the same stream |
+| Semantic | `weightedphraseexceptions` | `<phrase><weight>` | excludes those phrases from `weightedphraselist` scoring at build time |
+| Masking | `maskedphraselist` | one phrase per line | non-HTML text mutation |
+| Substitution | `substitutionlist` | `search => replace` | mutable text/HTML response |
+| Substitution | `regexsubstitutionlist` | `pattern => replace` | mutable text/HTML response |
+| Client | `bannedclientiplist` | IP or CIDR per line | request source IP check |
+| Client | `exceptionclientiplist` | IP or CIDR per line | overrides client IP bans |
+| Client | `e2guardianipgroups` | `IP/CIDR = group` | maps client IPs to profile groups |
+| Client | `filtergroupslist` | group names per line | defines ordered group profiles |
+| Log | `logurllist` | URL prefix | marks matched URLs for audit logging |
+| Log | `exceptionlogurllist` | URL prefix | overrides URL audit logging |
+| Log | `logregexpurllist` | Go/RE2 regex | marks matched URLs for audit logging |
+| Log | `exceptionlogregexpurllist` | Go/RE2 regex | overrides URL audit regex logging |
+| Log | `logregexpsitelist` | Go/RE2 regex | marks matched domains for audit logging |
+| Log | `exceptionlogregexpsitelist` | Go/RE2 regex | overrides domain audit regex logging |
+| Log | `logphraselist` | one phrase per line | marks matched body phrases for audit logging |
+| Log | `exceptionlogphraselist` | one phrase per line | overrides body phrase audit logging |
+
+Common rules:
+
+- Exceptions always win over bans within the same family.
+- Unknown filenames under `rules.include_dir` keep legacy behavior and are treated as plain blocked-domain lists.
+- Regex files are compiled during startup/reload. Invalid regexes abort that load with `file:line`.
+- List files support `#` comments, blank lines, and `.Include<relative/or/absolute/path>`.
+- Relative paths are resolved from the directory containing `lucidgate.toml` for TOML entries, and from the including file for `.Include`.
+
+## Curl Policy Battery
+
+`scripts/curl_policy_battery.sh` runs an end-to-end curl battery against a local HTTP upstream and a temporary LucidGate configuration. It uses the list files under `testdata/curl-policy-lists/` and does not depend on the public Internet.
+
+```bash
+make curl-policy
+```
+
+It validates:
+
+- domain and URL bans/exceptions
+- download extension, MIME, and filename policy
+- request/response header policy
+- request/response cookie policy
+- semantic phrase blocking and weighted scoring
+- masking
+- literal substitution
+- regexp substitution and capture expansion
+
+Default ports are `127.0.0.1:18080` for the upstream and `127.0.0.1:18081` for LucidGate. Override them when needed:
+
+```bash
+LUCIDGATE_CURL_UPSTREAM_PORT=19080 \
+LUCIDGATE_CURL_PROXY_PORT=19081 \
+make curl-policy
+```
+
+Set `KEEP_LUCIDGATE_CURL_TMP=1` to keep the generated config, CA, and logs for debugging.
 
 ## Access Profiles
 
@@ -274,11 +530,130 @@ replace = "Barcelona"
 [[substitution.rule]]
 search = "internal codename"
 replace = "public project"
+
+[[substitution.regex_rule]]
+pattern = "ca.*sa\\.png"
+replace = "carcasa.png"
+max_window_bytes = 65536
 ```
 
 Unlike masking, substitution does not preserve byte length and does not replace matches with `*`. It emits the configured `replace` value, so mutable textual responses are sent with `Transfer-Encoding: chunked` and without the upstream `Content-Length`.
 
 Substitution applies to textual responses, including HTML. For HTML, it runs on the raw HTML stream; it is intended for direct phrase replacement and does not perform visible-text-only token mapping.
+
+Regex substitution uses Go/RE2 regular expressions and is compiled during startup/reload. Capture expansion in replacements is supported (`$1`, `$2`, etc.). `max_window_bytes` bounds how many bytes a regex rule may hold to catch matches split across chunks; the default is 65536 and the hard limit is 1048576. A regex that needs to match across more bytes than that window should be made more specific.
+
+## External Phrase Lists (e2guardian-style)
+
+Banned phrases, weighted phrases, exception phrases, masking phrases, and substitution rules can also live in plain external files instead of being embedded in `lucidgate.toml`. This is the same idiom e2guardian uses and keeps long lists out of the main TOML.
+
+Recommended layout:
+
+```text
+lists/
+  sites/
+    bannedsitelist
+  phraselists/
+    bannedphraselist
+    weightedphraselist
+    exceptionphraselist
+    weightedphraseexceptions
+  masking/
+    maskedphraselist
+  substitution/
+    substitutionlist
+    regexsubstitutionlist
+```
+
+Wire the lists from `lucidgate.toml`:
+
+```toml
+[rules]
+include_dir = ["lists/sites"]
+
+[semantic]
+blocked_phrases = ["embedded phrase"]
+blocked_phrase_lists   = ["lists/phraselists/bannedphraselist"]
+weighted_phrase_lists  = ["lists/phraselists/weightedphraselist"]
+exception_phrase_lists = ["lists/phraselists/exceptionphraselist"]
+score_threshold = 100
+
+[masking]
+phrases      = ["embedded secret"]
+phrase_lists = ["lists/masking/maskedphraselist"]
+
+[substitution]
+rule_lists = ["lists/substitution/substitutionlist"]
+regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
+```
+
+Embedded entries (`blocked_phrases`, `[[semantic.weighted_phrase]]`, `phrases`, `[[substitution.rule]]`, `[[substitution.regex_rule]]`) keep working and are merged with the external entries; embedded values come first.
+
+Common parser rules for every list file:
+
+- One entry per line; UTF-8 text.
+- Lines starting with `#` (or anything after `#`) are comments.
+- Blank lines are ignored.
+- `.Include<path/to/file>` recursively includes another list file. Relative paths resolve against the file holding the `.Include`. Cycles are detected and rejected.
+- Relative `*_lists` paths in `lucidgate.toml` resolve against the directory holding `lucidgate.toml` (not the process working directory).
+- Directories are accepted in `*_lists` and `include_dir`: every regular file inside is read in alphabetical order. Single files are also accepted.
+- Parser errors include the source file and line number.
+
+Per-format syntax:
+
+- **bannedphraselist / exceptionphraselist / maskedphraselist:** one phrase per line.
+
+  ```text
+  # banned phrases
+  malware kit
+  credential dump
+  .Include<extra/banned_extra>
+  ```
+
+- **weightedphraselist / weightedphraseexceptions:** e2guardian `<phrase><weight>` syntax. Weight must be a positive integer.
+
+  ```text
+  <malware><60>
+  <credential dump><80>
+  ```
+
+  `weightedphraseexceptions` removes phrases (matched case-insensitively after trim) from `weightedphraselist` at build time. It is a phrase-level exclusion, not an e2guardian phrase-combination exception.
+
+- **substitutionlist:** `search => replace`. The replacement may be empty to delete the matched text.
+
+  ```text
+  Madrid => Barcelona
+  internal codename => public name
+  delete me =>
+  ```
+
+- **regexsubstitutionlist:** `pattern => replace`, compiled as Go/RE2 regexp. The replacement may use capture expansion (`$1`).
+
+  ```text
+  ca.*sa\.png => carcasa.png
+  image-([0-9]+)\.png => asset-$1.webp
+  ```
+
+### Streaming semantics for `exceptionphraselist`
+
+- When any exception phrase matches the inspected stream, the stream becomes "excepted": from that byte onward neither hard `bannedphraselist` matches nor `weightedphraselist` score accumulation will block the response.
+- Limitation: if a hard match precedes the exception in byte order, the block fires first because the proxy cannot rewind bytes already sent to the client. Place exception phrases that should reliably whitelist a page near the top of the document (titles, meta tags), or use `[rules].include_dir` regex/site exceptions to whitelist the URL up front.
+
+### Loading phrase lists from `[rules].include_dir`
+
+In addition to the dedicated `*_lists` keys above, the four phrase files can be loaded by filename through `[rules].include_dir`. This is the native e2guardian idiom and is convenient when sharing a single rules tree with other tooling:
+
+```toml
+[rules]
+include_dir = ["lists/sites", "lists/phraselists"]
+
+[semantic]
+score_threshold = 100
+```
+
+Recognized filenames inside any `include_dir` entry: `bannedphraselist`, `exceptionphraselist`, `weightedphraselist`, `weightedphraseexceptions` (plus the site/url/file/header/cookie families documented above). Files with unrecognized names keep the legacy behavior and are treated as plain blocked-domain lists.
+
+Duplicates are deduplicated when safe (identical entries) and rejected when ambiguous: a weighted phrase declared with conflicting weights, two substitution rules with the same `search`, or two regex substitution rules with the same `pattern`, all produce a clear error pointing at the offending file and line.
 
 ## HTML Injection
 
@@ -307,10 +682,23 @@ Set `logging.dump_dir` to write bounded JSONL body records:
 ```toml
 [logging]
 dump_dir = "dumps"
+dump_on_policy_hit = true
 max_capture_bytes = 8388608
 ```
 
-If `dump_dir` is set and `max_capture_bytes <= 0`, LucidGate uses an 8 MiB default cap for dumps. Dumps are for controlled analysis and can contain sensitive data.
+If `dump_on_policy_hit` is true, LucidGate only writes request and response body dumps to `dump_dir` when a policy blocks the connection (antivirus, domain, URL, header, or phrase blocking) or when an audit list is matched (e.g. `logurllist`, `logphraselist`). Otherwise, benign traffic payloads are immediately discarded from memory without touching disk.
+
+### Forensic Attribution & Security Notes
+
+To prevent data leakage and credential theft during internal forensic analysis, LucidGate enforces high-standard data protection by default:
+- **Redaction by Default:** In normal mode, sensitive credential fields detected in headers (e.g., `Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`) or bodies (JSON keys or form parameters like `password`, `token`, `api_key`, `secret`, `client_secret`, JWT tokens) are replaced with `[REDACTED]`.
+- **HMAC Correlation:** Configure `logging.audit_key` (or command-line flag `--audit-key` / environment variable `LUCIDGATE_AUDIT_KEY`) to replace redacted secrets with their cryptographic hash: `HMAC-SHA256(audit_key, secret_value)`. This allows secure attribution and correlation across flows without storing plain-text secrets.
+- **Explicit Cleartext Mode:** You can enable dumping of plain-text credentials by setting `logging.dump_credentials_cleartext = true` (or `--dump-credentials-cleartext` / `LUCIDGATE_DUMP_CREDENTIALS_CLEARTEXT=true`).
+  - **Constraints:** This setting strictly requires `dump_on_policy_hit = true` to prevent general traffic leakage. LucidGate will abort startup if this is violated.
+  - **Loud Warnings:** It logs a critical safety warning at startup.
+  - **Metadata:** Each dump is tagged with `"contains_cleartext_credentials": true`.
+  - **Permissions:** Applies strict permissions (`0700` for dump directories, `0600` for dump files).
+  - **HTTPS limitations:** Note that HTTPS request/response bodies can only be inspected and dumped if HTTPS termination/MITM intercept is actively configured and active for the traffic; pure `CONNECT` tunnels without termination cannot be decrypted.
 
 ## Curl Examples
 

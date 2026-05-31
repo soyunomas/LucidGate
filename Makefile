@@ -83,6 +83,21 @@ test-race: ## Run tests with the race detector.
 smoke: build ## Run an end-to-end smoke test against the built binary.
 	LUCIDGATE_BIN=$$(pwd)/$(BIN) GOCACHE=$(GOCACHE) $(GO) test -count=1 ./smoke
 
+.PHONY: ws-smoke
+ws-smoke: build ## Run the binary WebSocket smoke test.
+	LUCIDGATE_BIN=$$(pwd)/$(BIN) GOCACHE=$(GOCACHE) $(GO) test -count=1 ./smoke -run TestBinaryWebSocketSmoke
+
+.PHONY: alt-svc-smoke
+alt-svc-smoke: build ## Run the binary Alt-Svc stripping smoke test.
+	LUCIDGATE_BIN=$$(pwd)/$(BIN) GOCACHE=$(GOCACHE) $(GO) test -count=1 ./smoke -run TestBinaryAltSvcSmokeStripsHTTP3Advertising
+
+.PHONY: curl-policy
+curl-policy: build ## Run the curl-based e2guardian policy battery.
+	LUCIDGATE_BIN=$$(pwd)/$(BIN) scripts/curl_policy_battery.sh
+
+.PHONY: p0-smoke
+p0-smoke: ws-smoke alt-svc-smoke curl-policy ## Run the P0 WebSocket, Alt-Svc, and policy smokes.
+
 .PHONY: cover
 cover: ## Run tests with coverage and write coverage/coverage.out.
 	mkdir -p $(COVER_DIR)
@@ -230,3 +245,23 @@ clean: ## Remove build, dist and coverage artifacts.
 
 .PHONY: release
 release: clean verify build-all deb ## Run verification and produce release artifacts.
+
+.PHONY: bench-load
+bench-load: build ## Run the high-performance load and leak benchmark suite.
+	$(GO) run bench/load_bench.go -mode=all
+
+.PHONY: bench-attacks
+bench-attacks: ## Run the Slowloris, Slow-POST, and HTTP/2 Rapid Reset attacks.
+	$(GO) run bench/attacks.go -type=all
+
+.PHONY: bench-degradation
+bench-degradation: build ## Run the elegant degradation suite at 200% capacity.
+	$(GO) run bench/degradation.go
+
+.PHONY: bench-profile
+bench-profile: ## Collect CPU and heap pprof profiles.
+	$(GO) run bench/profile.go -seconds=5
+
+.PHONY: bench-all
+bench-all: bench-load bench-attacks bench-degradation ## Run all benchmarks and resilience test suites.
+

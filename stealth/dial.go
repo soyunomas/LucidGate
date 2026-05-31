@@ -77,10 +77,19 @@ func (d Dialer) DialFirefox(ctx context.Context, address, serverName string) (*u
 	if config.ClientSessionCache == nil {
 		config.ClientSessionCache = upstreamSessionCache
 	}
+	// First dials to a new ServerName have no cached session, so the
+	// UtlsPreSharedKeyExtension we append to the spec must self-omit instead
+	// of aborting the handshake with "empty psk detected".
+	config.OmitEmptyPsk = true
 
-	tlsConn := utls.UClient(tcpConn, config, utls.HelloFirefox_Auto)
-	if err := forceHTTP1ALPN(tlsConn); err != nil {
-		return nil, fmt.Errorf("force upstream alpn: %w", err)
+	spec, err := firefoxSpecWithALPNAndPSK(config.NextProtos)
+	if err != nil {
+		return nil, fmt.Errorf("build firefox spec: %w", err)
+	}
+
+	tlsConn := utls.UClient(tcpConn, config, utls.HelloCustom)
+	if err := tlsConn.ApplyPreset(&spec); err != nil {
+		return nil, fmt.Errorf("apply firefox spec: %w", err)
 	}
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return nil, fmt.Errorf("upstream utls handshake: %w", err)
@@ -93,18 +102,39 @@ func (d Dialer) DialFirefox(ctx context.Context, address, serverName string) (*u
 	return tlsConn, nil
 }
 
-func forceHTTP1ALPN(conn *utls.UConn) error {
-	if err := conn.BuildHandshakeState(); err != nil {
-		return err
+// firefoxHTTP1SpecWithPSK derives a fresh ClientHelloSpec from
+// HelloFirefox_120 with two operational tweaks the upstream stack needs:
+//
+//  1. The ALPN list is reduced to {"http/1.1"} so the upstream never picks
+//     HTTP/2 (the relay only speaks HTTP/1.1 today; negotiating h2 here
+//     would silently break header/body framing).
+//  2. A trailing UtlsPreSharedKeyExtension is appended. The vanilla
+//     Firefox_120 parrot includes PSKKeyExchangeModes and SessionTicket but
+//     omits the actual pre_shared_key extension, which means TLS 1.3
+//     resumption never engages (RFC 8446 §4.2.11 mandates pre_shared_key
+//     last). Without this, the shared upstreamSessionCache is dead weight on
+//     TLS 1.3 only endpoints (Google, Cloudflare, Fastly) and every reconnect
+//     pays a full 2-RTT handshake. The extension is inert when the cache has
+//     no session for ServerName, so first dials are unaffected.
+//
+// The spec is rebuilt per dial because ClientHelloSpec is not safe for
+// concurrent mutation by ApplyPreset.
+func firefoxSpecWithALPNAndPSK(protocols []string) (utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(utls.HelloFirefox_120)
+	if err != nil {
+		return utls.ClientHelloSpec{}, err
 	}
-	for _, ext := range conn.Extensions {
-		if alpn, ok := ext.(*utls.ALPNExtension); ok {
-			alpn.AlpnProtocols = upstreamHTTP1ALPN
-			conn.HandshakeState.Hello.AlpnProtocols = upstreamHTTP1ALPN
-			return nil
+	hasPSK := false
+	for _, ext := range spec.Extensions {
+		switch e := ext.(type) {
+		case *utls.ALPNExtension:
+			e.AlpnProtocols = protocols
+		case *utls.UtlsPreSharedKeyExtension, *utls.FakePreSharedKeyExtension:
+			hasPSK = true
 		}
 	}
-	conn.Extensions = append(conn.Extensions, &utls.ALPNExtension{AlpnProtocols: upstreamHTTP1ALPN})
-	conn.HandshakeState.Hello.AlpnProtocols = upstreamHTTP1ALPN
-	return nil
+	if !hasPSK {
+		spec.Extensions = append(spec.Extensions, &utls.UtlsPreSharedKeyExtension{})
+	}
+	return spec, nil
 }
