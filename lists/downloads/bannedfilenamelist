@@ -1,3 +1,17 @@
-# LucidGate blocked filenames.
-# Matches basename from URL path or Content-Disposition.
-secret.bin
+# LucidGate example list: bannedfilenamelist
+# Format: One filename fragment per line. It is compared with the response filename derived from URL or Content-Disposition.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# setup.exe
+# invoice.scr
+# payload.dll
+# installer.msi
+# update.bat
+# macro-document.docm
+# passwords.zip
+# secrets.tar.gz
+# private-key.pem
+# database.dump

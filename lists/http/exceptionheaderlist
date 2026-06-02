@@ -1,2 +1,17 @@
-# LucidGate allowed header phrase overrides.
-x-tracker: allowed
+# LucidGate example list: exceptionheaderlist
+# Format: One lowercase or mixed-case header phrase per line, normally "Header-Name: value-fragment".
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# x-tracker: enabled
+# x-risk-score: high
+# x-debug-mode: true
+# user-agent: blocked-client
+# referer: http://untrusted.example
+# authorization: bearer test-token
+# x-forwarded-for: 10.0.0.1
+# x-leak-marker: secret
+# cookie: tracking_id=
+# x-experiment: unsafe

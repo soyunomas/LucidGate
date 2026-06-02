@@ -1,0 +1,17 @@
+# LucidGate example list: bannedtimelist
+# Format: Five fields per line: start_hour start_min end_hour end_min days. Days use 0=Mon through 6=Sun. The interval is blocked time.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# 8 0 12 0 01234
+# 13 0 17 30 01234
+# 18 0 22 0 01234
+# 0 0 6 0 0123456
+# 22 0 23 59 0123456
+# 9 30 10 30 0
+# 9 30 10 30 1
+# 9 30 10 30 2
+# 10 0 14 0 56
+# 14 0 16 0 01234

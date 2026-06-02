@@ -1,0 +1,17 @@
+# LucidGate example list: responseheaderregexplist
+# Format: One request/response header rewrite per line: regexp => replacement. Empty replacement deletes the header. Framing headers are protected by LucidGate.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# (?i)^User-Agent:.*Chrome.* => User-Agent: Mozilla/5.0
+# (?i)^Cookie:.*tracking_id=[^;]+;? => 
+# (?i)^X-Debug-Mode:.* => 
+# (?i)^X-Experiment:.* => X-Experiment: stable
+# (?i)^Referer:\s*http://(.*)$ => Referer: https://$1
+# (?i)^Server:.*Apache.* => Server: LucidGate
+# (?i)^X-Powered-By:.* => 
+# (?i)^X-Unwanted:.* => 
+# (?i)^Cache-Control:.*no-store.* => Cache-Control: private
+# (?i)^Pragma:.* => 

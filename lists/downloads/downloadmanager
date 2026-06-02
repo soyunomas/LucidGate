@@ -1,0 +1,17 @@
+# LucidGate example list: downloadmanager
+# Format: Three fields per line: banned|exception ext|mime value. This combines extension and MIME download policy in one file.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# banned ext .exe
+# banned ext .dll
+# banned ext .msi
+# banned ext .scr
+# banned mime application/x-msdownload
+# banned mime application/x-dosexec
+# exception ext .txt
+# exception ext .pdf
+# exception mime application/pdf
+# exception mime image/png

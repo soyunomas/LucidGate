@@ -1,0 +1,17 @@
+# LucidGate example list: oldweightedphraselist
+# Format: Weighted phrase syntax is <phrase><weight>. The score threshold is configured in TOML as semantic.score_threshold.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# <credential dump><80>
+# <private api key><70>
+# <internal admin password><90>
+# <malware staging url><60>
+# <phishing landing page><60>
+# <exploit kit marker><70>
+# <password reset token><50>
+# <confidential roadmap><30>
+# <secret signing key><90>
+# <production database dump><90>

@@ -1,5 +1,17 @@
-# LucidGate blocked download extensions.
-# Accepts ".exe" or "exe"; matching is case-insensitive.
-.exe
-.scr
-.msi
+# LucidGate example list: bannedextensionlist
+# Format: One file extension per line. Leading dot is optional; using it is clearer.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# .exe
+# .dll
+# .msi
+# .scr
+# .bat
+# .cmd
+# .ps1
+# .vbs
+# .jar
+# .apk

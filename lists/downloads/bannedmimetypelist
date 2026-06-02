@@ -1,4 +1,17 @@
-# LucidGate blocked MIME types.
-# Exact MIME types and type/* wildcards are supported.
-application/x-msdownload
-application/x-dosexec
+# LucidGate example list: bannedmimetypelist
+# Format: One MIME type per line. Use lowercase type/subtype where possible.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# application/x-msdownload
+# application/x-dosexec
+# application/x-sh
+# application/java-archive
+# application/vnd.android.package-archive
+# application/octet-stream
+# application/x-msi
+# application/x-mach-binary
+# application/x-elf
+# application/x-executable

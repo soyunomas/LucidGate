@@ -1,0 +1,17 @@
+# LucidGate example list: urlregexplist
+# Format: One URL regexp rewrite per line: pattern => replacement. Rewrites keep the original host for safety.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# ^http://example\.test/(.*)$ => https://example.test/$1
+# ^https://example\.test/old/(.*)$ => https://example.test/new/$1
+# ([?&])debug=true(&|$) => $1
+# ^https://example\.test/search\?q=(.*)$ => https://example.test/search?safe=1&q=$1
+# ^https://example\.test/docs/v1/(.*)$ => https://example.test/docs/v2/$1
+# ^https://example\.test/insecure/(.*)$ => https://example.test/blocked/$1
+# ^https://example\.test/download/(.*)$ => https://example.test/downloads/$1
+# ^https://example\.test/profile/(.*)$ => https://example.test/account/$1
+# ^https://example\.test/raw/(.*)$ => https://example.test/view/$1
+# ^https://example\.test/api/(.*)$ => https://example.test/api/safe/$1

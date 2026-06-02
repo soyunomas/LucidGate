@@ -1,0 +1,17 @@
+# LucidGate example list: filtergroupslist
+# Format: One filter group/profile name per line. e2guardianipgroups may reference these by 1-based numeric index or by name.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# default
+# students
+# staff
+# admins
+# guests
+# lab
+# kiosk
+# restricted
+# audit-only
+# break-glass

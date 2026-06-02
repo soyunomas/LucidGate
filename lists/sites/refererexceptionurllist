@@ -1,0 +1,17 @@
+# LucidGate example list: refererexceptionurllist
+# Format: One canonical URL prefix per line. Include scheme and host; a request matches exact URL or any URL starting with this value.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# https://example.test/private
+# https://example.test/private/
+# https://example.test/downloads/blocked
+# http://legacy.example.test/insecure
+# https://portal.example.test/admin
+# https://portal.example.test/api/export
+# https://files.example.test/secrets/
+# https://accounts.example.test/reset
+# https://chat.example.test/upload
+# https://repo.example.test/internal

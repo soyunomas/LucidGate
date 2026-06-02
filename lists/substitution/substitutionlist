@@ -1,3 +1,17 @@
-# LucidGate substitution rules.
-# Sintaxis: search => replace   (replace puede quedar vacio para borrar).
-internal codename => public name
+# LucidGate example list: substitutionlist
+# Format: One literal streaming substitution per line: search => replacement. Empty replacement deletes the matched text.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# http://example.test => https://example.test
+# internal codename => [redacted]
+# staging-password => [redacted]
+# debug=true => debug=false
+# X-Unsafe => X-Safe
+# old.example.test => new.example.test
+# api_key=demo => api_key=[redacted]
+# token=demo => token=[redacted]
+# private note => public note
+# legacy path => current path

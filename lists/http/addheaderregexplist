@@ -1,0 +1,17 @@
+# LucidGate example list: addheaderregexplist
+# Format: Either "Header: value" for unconditional add, or "url-regex => Header: value" for conditional request header add.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# X-LucidGate-Policy: default
+# X-Content-Guard: enabled
+# X-Proxy-Audit: sampled
+# ^https://example\.test/secure => X-Secure-Zone: yes
+# ^https://example\.test/api/ => X-API-Policy: restricted
+# ^https://files\.example\.test/ => X-Download-Policy: strict
+# ^https://portal\.example\.test/admin => X-Admin-Path: true
+# X-Client-Inspection: on
+# X-Policy-Version: 2026-06-01
+# X-Org-Unit: example

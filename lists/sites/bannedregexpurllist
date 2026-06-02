@@ -1,0 +1,17 @@
+# LucidGate example list: bannedregexpurllist
+# Format: One Go regular expression per line. It is matched against the canonical URL including scheme, host, path and query.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# ^https://example\.test/private($|/|\?)
+# ^https://[^/]+\.example\.test/admin($|/|\?)
+# /download/.*\.(exe|dll)$
+# [?&]debug=true(&|$)
+# ^http://legacy\.example\.test/
+# /api/(export|dump)($|/|\?)
+# /token=[A-Za-z0-9_-]+
+# ^https://files\.example\.test/secrets/
+# /redirect\?to=http%3A%2F%2F
+# ^https://repo\.example\.test/internal/

@@ -1,0 +1,17 @@
+# LucidGate example list: logsiteiplist
+# Format: One IP address or CIDR prefix per line. IPv4 and IPv6 are accepted.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# 192.0.2.10
+# 192.0.2.0/24
+# 198.51.100.44
+# 198.51.100.0/25
+# 203.0.113.7
+# 203.0.113.0/24
+# 2001:db8::10
+# 2001:db8:10::/48
+# 2001:db8:20::42
+# 2001:db8:30::/48

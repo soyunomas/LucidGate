@@ -1,0 +1,17 @@
+# LucidGate example list: exceptionregexpsitelist
+# Format: One Go regular expression per line. It is matched against the normalized hostname.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# (^|\.)ads[0-9]+\.example\.test$
+# (^|\.)tracking-[a-z]+\.example\.test$
+# ^malware-[0-9]+\.example\.test$
+# (^|\.)phish(ing)?\.example\.test$
+# (^|\.)risk-cdn\.example\.test$
+# (^|\.)upload-[a-z0-9-]+\.example\.test$
+# (^|\.)social-[0-9]+\.example\.test$
+# (^|\.)games?\.example\.test$
+# (^|\.)short-[a-z]+\.example\.test$
+# (^|\.)blocked-[a-z]+\.example\.test$

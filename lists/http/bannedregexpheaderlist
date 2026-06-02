@@ -1,0 +1,17 @@
+# LucidGate example list: bannedregexpheaderlist
+# Format: One Go regular expression per line matched against flattened "Header: value" lines.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# (?i)^X-Tracker:.*enabled
+# (?i)^X-Risk-Score:\s*high
+# (?i)^X-Debug-Mode:\s*true
+# (?i)^User-Agent:.*blocked-client
+# (?i)^Referer:\s*http://untrusted\.example
+# (?i)^Authorization:\s*Bearer\s+[A-Za-z0-9._-]+
+# (?i)^X-Forwarded-For:\s*10\.
+# (?i)^X-Leak-Marker:.*secret
+# (?i)^Cookie:.*tracking_id=
+# (?i)^X-Experiment:\s*unsafe

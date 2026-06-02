@@ -1,2 +1,17 @@
-# LucidGate allowed cookie phrase overrides.
-trackid=allowed
+# LucidGate example list: exceptioncookiephraselist
+# Format: One cookie phrase per line. Use name= or a distinctive value fragment.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# tracking_id=
+# session_debug=
+# unsafe_consent=1
+# ad_profile=
+# risk_marker=high
+# legacy_token=
+# xleak=
+# analytics_id=
+# experiment_unsafe=
+# thirdparty_id=

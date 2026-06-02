@@ -1,0 +1,17 @@
+# LucidGate example list: nocheckcertsitelist
+# Format: One domain per line. Use lowercase hostnames without scheme or path. A leading *. is not required; subdomains are matched by the domain matcher.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# example-block.test
+# ads.example.test
+# tracking.example.test
+# malware.example.test
+# phishing.example.test
+# cdn-risk.example.test
+# uploads.example.test
+# social.example.test
+# games.example.test
+# shortener.example.test

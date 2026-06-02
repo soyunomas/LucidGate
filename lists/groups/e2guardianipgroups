@@ -1,0 +1,17 @@
+# LucidGate example list: e2guardianipgroups
+# Format: One mapping per line: client-ip-or-cidr=group-name-or-1-based-index.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# 192.0.2.0/24=students
+# 192.0.2.10=admins
+# 198.51.100.0/24=staff
+# 198.51.100.50=guests
+# 203.0.113.0/25=restricted
+# 203.0.113.42=audit-only
+# 2001:db8:100::/48=lab
+# 2001:db8:100::10=kiosk
+# 2001:db8:200::/48=2
+# 2001:db8:200::20=break-glass

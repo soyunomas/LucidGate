@@ -1,0 +1,17 @@
+# LucidGate example list: alertcategorylist
+# Format: One alert category label per line. These are labels for alerting/logging integrations.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# malware
+# phishing
+# credential-leak
+# policy-violation
+# download-block
+# header-block
+# cookie-block
+# semantic-block
+# dlp-redaction
+# manual-review

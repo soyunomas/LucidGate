@@ -1,0 +1,17 @@
+# LucidGate example list: oldexceptionphraselist
+# Format: One plain phrase per line. Matching is streaming and case-insensitive in the semantic/masking filters.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# credential dump
+# private api key
+# internal admin password
+# malware staging url
+# phishing landing page
+# exploit kit marker
+# password reset token
+# confidential roadmap
+# secret signing key
+# production database dump

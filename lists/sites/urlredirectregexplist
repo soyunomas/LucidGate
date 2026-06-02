@@ -1,0 +1,17 @@
+# LucidGate example list: urlredirectregexplist
+# Format: One URL regexp redirect per line: pattern => absolute redirect target. The proxy returns an HTTP redirect.
+# Lines beginning with # are comments and are ignored by the loader.
+# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# Commented examples:
+# ^http://example\.test/(.*)$ => https://example.test/$1
+# ^https://old.example\.test/(.*)$ => https://new.example.test/$1
+# ^https://example\.test/legacy$ => https://example.test/current
+# ^https://example\.test/search\?q=(.*)$ => https://search.example.test/?q=$1
+# ^https://example\.test/help$ => https://docs.example.test/
+# ^https://example\.test/status$ => https://status.example.test/
+# ^https://example\.test/login-old$ => https://example.test/login
+# ^https://example\.test/wiki/(.*)$ => https://docs.example.test/$1
+# ^https://example\.test/forum/(.*)$ => https://community.example.test/$1
+# ^https://example\.test/downloads$ => https://files.example.test/
