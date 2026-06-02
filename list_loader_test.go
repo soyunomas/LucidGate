@@ -407,12 +407,19 @@ func TestParseConfigWithE2GuardianLoggingLists(t *testing.T) {
 	listsDir := filepath.Join(dir, "lists")
 
 	// Create mockup e2guardian logging list files
+	writeFile(t, filepath.Join(listsDir, "logsitelist"), "audit.example\n")
+	writeFile(t, filepath.Join(listsDir, "logsiteiplist"), "203.0.113.10\n2001:db8::/32\n")
 	writeFile(t, filepath.Join(listsDir, "logurllist"), "example.com/log\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionlogurllist"), "example.com/log/except\n")
 	writeFile(t, filepath.Join(listsDir, "logregexpurllist"), "/log-rx-[0-9]+\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionlogregexpurllist"), "/no-log-rx-[0-9]+\n")
 	writeFile(t, filepath.Join(listsDir, "logregexpsitelist"), "^logsite\\.org$\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionlogregexpsitelist"), "^exceptsite\\.org$\n")
+	writeFile(t, filepath.Join(listsDir, "nologsitelist"), "static.example\n")
+	writeFile(t, filepath.Join(listsDir, "nologsiteiplist"), "198.51.100.0/24\n")
+	writeFile(t, filepath.Join(listsDir, "nologurllist"), "example.com/private\n")
+	writeFile(t, filepath.Join(listsDir, "nologregexpurllist"), "/quiet-[0-9]+\n")
+	writeFile(t, filepath.Join(listsDir, "nologextensionlist"), ".png\n")
 	writeFile(t, filepath.Join(listsDir, "logphraselist"), "log phrase\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionlogphraselist"), "except log phrase\n")
 
@@ -433,6 +440,12 @@ include_dir = ["lists"]
 	}
 
 	// Verify URL and Site logging configs loaded correctly
+	if len(policy.Log.LogSites) != 1 || policy.Log.LogSites[0] != "audit.example" {
+		t.Fatalf("LogSites = %#v, want [audit.example]", policy.Log.LogSites)
+	}
+	if len(policy.Log.LogSiteIPs) != 2 || policy.Log.LogSiteIPs[0] != "203.0.113.10" || policy.Log.LogSiteIPs[1] != "2001:db8::/32" {
+		t.Fatalf("LogSiteIPs = %#v, want [203.0.113.10 2001:db8::/32]", policy.Log.LogSiteIPs)
+	}
 	if len(policy.Log.LogURLs) != 1 || policy.Log.LogURLs[0] != "example.com/log" {
 		t.Fatalf("LogURLs = %#v, want [example.com/log]", policy.Log.LogURLs)
 	}
@@ -451,6 +464,21 @@ include_dir = ["lists"]
 	if len(policy.Log.ExceptionLogRegexSites) != 1 || policy.Log.ExceptionLogRegexSites[0].Pattern != "^exceptsite\\.org$" {
 		t.Fatalf("ExceptionLogRegexSites = %#v, want pattern '^exceptsite\\.org$'", policy.Log.ExceptionLogRegexSites)
 	}
+	if len(policy.Log.NoLogSites) != 1 || policy.Log.NoLogSites[0] != "static.example" {
+		t.Fatalf("NoLogSites = %#v, want [static.example]", policy.Log.NoLogSites)
+	}
+	if len(policy.Log.NoLogSiteIPs) != 1 || policy.Log.NoLogSiteIPs[0] != "198.51.100.0/24" {
+		t.Fatalf("NoLogSiteIPs = %#v, want [198.51.100.0/24]", policy.Log.NoLogSiteIPs)
+	}
+	if len(policy.Log.NoLogURLs) != 1 || policy.Log.NoLogURLs[0] != "example.com/private" {
+		t.Fatalf("NoLogURLs = %#v, want [example.com/private]", policy.Log.NoLogURLs)
+	}
+	if len(policy.Log.NoLogRegexURLs) != 1 || policy.Log.NoLogRegexURLs[0].Pattern != "/quiet-[0-9]+" {
+		t.Fatalf("NoLogRegexURLs = %#v, want pattern '/quiet-[0-9]+'", policy.Log.NoLogRegexURLs)
+	}
+	if len(policy.Log.NoLogExtensions) != 1 || policy.Log.NoLogExtensions[0] != ".png" {
+		t.Fatalf("NoLogExtensions = %#v, want [.png]", policy.Log.NoLogExtensions)
+	}
 
 	// Verify LogPhrases and ExceptionLogPhrases in appConfig
 	if len(cfg.LogPhrases) != 1 || cfg.LogPhrases[0] != "log phrase" {
@@ -458,5 +486,35 @@ include_dir = ["lists"]
 	}
 	if len(cfg.ExceptionLogPhrases) != 1 || cfg.ExceptionLogPhrases[0] != "except log phrase" {
 		t.Fatalf("ExceptionLogPhrases = %#v, want [except log phrase]", cfg.ExceptionLogPhrases)
+	}
+}
+
+func TestLoadRulePolicyReportsLogSiteIPParseErrorWithLineInfo(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "logsiteiplist"), "203.0.113.10\nbad-ip\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	_, err := loadRulePolicy(cfg)
+	if err == nil || !strings.Contains(err.Error(), "logsiteiplist:2") {
+		t.Fatalf("loadRulePolicy() error = %v, want logsiteiplist:2", err)
+	}
+}
+
+func TestLoadRulePolicyReportsSiteIPParseErrorWithLineInfo(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "bannedsiteiplist"), "203.0.113.0/24\nbad-ip\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	_, err := loadRulePolicy(cfg)
+	if err == nil || !strings.Contains(err.Error(), "bannedsiteiplist:2") {
+		t.Fatalf("loadRulePolicy() error = %v, want bannedsiteiplist:2", err)
 	}
 }

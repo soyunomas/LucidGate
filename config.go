@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/pelletier/go-toml/v2"
+
+	"lucidgate/proxy"
 )
 
 const version = "0.1.0"
@@ -65,11 +67,26 @@ type appConfig struct {
 	AntivirusTrickle             time.Duration
 	AntivirusTimeout             time.Duration
 	ShowVersion                  bool
-	Substitutions                []SubstitutionConfig
-	SubstitutionRuleLists        []string
-	RegexSubstitutions           []RegexSubstitutionConfig
-	RegexSubstitutionRuleLists   []string
+	Substitutions                     []SubstitutionConfig
+	SubstitutionRuleLists             []string
+	RegexSubstitutions                []RegexSubstitutionConfig
+	RegexSubstitutionRuleLists        []string
+	RequestSubstitutions              []SubstitutionConfig
+	RequestSubstitutionRuleLists      []string
+	RegexRequestSubstitutions         []RegexSubstitutionConfig
+	RegexRequestSubstitutionRuleLists []string
+	NoCheckCertSites                  []string
+	NoCheckCertSiteIPs                []string
+	NoCheckCertSitesMatcher           *proxy.DomainMatcher
+	NoCheckCertSiteIPsMatcher         *proxy.IPMatcher
+	GreySSLSites                      []string
+	GreySSLSiteIPs                    []string
+	GreySSLSitesMatcher               *proxy.DomainMatcher
+	GreySSLSiteIPsMatcher             *proxy.IPMatcher
 	BannedClients                []string
+	AccessLog                    string
+	AlertLog                     string
+	AlertCategories              []string
 	ExceptionClients             []string
 	FilterGroups                 []string
 	IPGroupMappings              []IPGroupMapping
@@ -273,6 +290,8 @@ type tomlConfig struct {
 		DumpMaxBackups           *int     `toml:"dump_max_backups"`
 		DumpMinFreeSpaceMB       *int64   `toml:"dump_min_free_space_mb"`
 		DumpCompress             *bool    `toml:"dump_compress"`
+		AccessLog                string   `toml:"access_log"`
+		AlertLog                 string   `toml:"alert_log"`
 	} `toml:"logging"`
 	Metrics struct {
 		Enabled    *bool   `toml:"enabled"`
@@ -340,6 +359,19 @@ type tomlConfig struct {
 			MaxWindowBytes int    `toml:"max_window_bytes"`
 		} `toml:"regex_rule"`
 	} `toml:"substitution"`
+	RequestSubstitution struct {
+		RuleLists      []string `toml:"rule_lists"`
+		RegexRuleLists []string `toml:"regex_rule_lists"`
+		Rules          []struct {
+			Search  string `toml:"search"`
+			Replace string `toml:"replace"`
+		} `toml:"rule"`
+		RegexRules []struct {
+			Pattern        string `toml:"pattern"`
+			Replace        string `toml:"replace"`
+			MaxWindowBytes int    `toml:"max_window_bytes"`
+		} `toml:"regex_rule"`
+	} `toml:"request_substitution"`
 	Tracing struct {
 		Enabled     *bool    `toml:"enabled"`
 		Endpoint    *string  `toml:"endpoint"`
@@ -492,6 +524,12 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 	if raw.Logging.DumpCompress != nil {
 		cfg.DumpCompress = *raw.Logging.DumpCompress
 	}
+	if raw.Logging.AccessLog != "" {
+		cfg.AccessLog = raw.Logging.AccessLog
+	}
+	if raw.Logging.AlertLog != "" {
+		cfg.AlertLog = raw.Logging.AlertLog
+	}
 	if len(raw.Rules.IncludeDir) > 0 {
 		cfg.IncludeDirs = append(cfg.IncludeDirs[:0], raw.Rules.IncludeDir...)
 	}
@@ -585,6 +623,25 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 			})
 		}
 	}
+	if len(raw.RequestSubstitution.Rules) > 0 {
+		cfg.RequestSubstitutions = cfg.RequestSubstitutions[:0]
+		for _, rule := range raw.RequestSubstitution.Rules {
+			cfg.RequestSubstitutions = append(cfg.RequestSubstitutions, SubstitutionConfig{
+				Search:  rule.Search,
+				Replace: rule.Replace,
+			})
+		}
+	}
+	if len(raw.RequestSubstitution.RegexRules) > 0 {
+		cfg.RegexRequestSubstitutions = cfg.RegexRequestSubstitutions[:0]
+		for _, rule := range raw.RequestSubstitution.RegexRules {
+			cfg.RegexRequestSubstitutions = append(cfg.RegexRequestSubstitutions, RegexSubstitutionConfig{
+				Pattern:        rule.Pattern,
+				Replace:        rule.Replace,
+				MaxWindowBytes: rule.MaxWindowBytes,
+			})
+		}
+	}
 	if len(raw.Semantic.BlockedPhraseLists) > 0 {
 		cfg.SemanticBlockedPhraseLists = append(cfg.SemanticBlockedPhraseLists[:0], raw.Semantic.BlockedPhraseLists...)
 	}
@@ -602,6 +659,12 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 	}
 	if len(raw.Substitution.RegexRuleLists) > 0 {
 		cfg.RegexSubstitutionRuleLists = append(cfg.RegexSubstitutionRuleLists[:0], raw.Substitution.RegexRuleLists...)
+	}
+	if len(raw.RequestSubstitution.RuleLists) > 0 {
+		cfg.RequestSubstitutionRuleLists = append(cfg.RequestSubstitutionRuleLists[:0], raw.RequestSubstitution.RuleLists...)
+	}
+	if len(raw.RequestSubstitution.RegexRuleLists) > 0 {
+		cfg.RegexRequestSubstitutionRuleLists = append(cfg.RegexRequestSubstitutionRuleLists[:0], raw.RequestSubstitution.RegexRuleLists...)
 	}
 
 	if raw.Tracing.Enabled != nil {
@@ -662,6 +725,24 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 			return err
 		}
 		cfg.RegexSubstitutions = merged
+	}
+	if extra, err := loadSubstitutionFiles(configDir, cfg.RequestSubstitutionRuleLists); err != nil {
+		return err
+	} else {
+		merged, err := mergeSubstitutions(cfg.RequestSubstitutions, extra)
+		if err != nil {
+			return err
+		}
+		cfg.RequestSubstitutions = merged
+	}
+	if extra, err := loadRegexSubstitutionFiles(configDir, cfg.RegexRequestSubstitutionRuleLists); err != nil {
+		return err
+	} else {
+		merged, err := mergeRegexSubstitutions(cfg.RegexRequestSubstitutions, extra)
+		if err != nil {
+			return err
+		}
+		cfg.RegexRequestSubstitutions = merged
 	}
 	return nil
 }

@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync/atomic"
@@ -24,11 +26,36 @@ import (
 var (
 	isReloading    int32
 	isShuttingDown int32
+
+	currentAccessPath string
+	currentAccessFile *os.File
+	currentAccessLog  *slog.Logger
+	currentAccessAH   *proxy.AsyncHandler
+
+	currentAlertPath string
+	currentAlertFile *os.File
+	currentAlertLog  *slog.Logger
+	currentAlertAH   *proxy.AsyncHandler
 )
 
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
+
+	defer func() {
+		if currentAccessAH != nil {
+			currentAccessAH.Close()
+		}
+		if currentAccessFile != nil {
+			_ = currentAccessFile.Close()
+		}
+		if currentAlertAH != nil {
+			currentAlertAH.Close()
+		}
+		if currentAlertFile != nil {
+			_ = currentAlertFile.Close()
+		}
+	}()
 
 	cfg, err := parseConfig(os.Args[1:], os.Getenv, os.Stderr)
 	if err != nil {
@@ -172,11 +199,35 @@ func main() {
 		os.Exit(1)
 	}
 	server.PrewarmCertificates(cfg.MITMPrewarmHosts)
+	insecureFunc := func(address, serverName string) bool {
+		cfgVal := currentConfig.Load()
+		if cfgVal == nil {
+			return false
+		}
+		c := cfgVal.(*appConfig)
+		if c.NoCheckCertSitesMatcher != nil && c.NoCheckCertSitesMatcher.Match(serverName) {
+			return true
+		}
+		if c.NoCheckCertSiteIPsMatcher != nil {
+			hostStr := address
+			if h, _, err := net.SplitHostPort(address); err == nil {
+				hostStr = h
+			}
+			if addr, err := netip.ParseAddr(hostStr); err == nil {
+				if c.NoCheckCertSiteIPsMatcher.Match(addr) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	server.SetUpstreamDialer(stealth.Dialer{
 		Timeout: cfg.DialTimeout,
 		Config: &utls.Config{
 			InsecureSkipVerify: cfg.UpstreamInsecure,
 		},
+		InsecureSkipVerifyFunc: insecureFunc,
 	})
 	server.SetH2UpstreamDialer(stealth.Dialer{
 		Timeout: cfg.DialTimeout,
@@ -184,6 +235,7 @@ func main() {
 			InsecureSkipVerify: cfg.UpstreamInsecure,
 			NextProtos:         []string{"h2", "http/1.1"},
 		},
+		InsecureSkipVerifyFunc: insecureFunc,
 	})
 	startConfigReloader(ctx, os.Args[1:], &currentConfig, server, logger)
 	if err := server.Serve(ctx); err != nil && err != context.Canceled {
@@ -201,6 +253,10 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 	policyConfig, err := loadRulePolicy(cfg)
 	if err != nil {
 		return err
+	}
+
+	if err := setupLoggerSinks(cfg); err != nil {
+		return fmt.Errorf("setup logger sinks: %w", err)
 	}
 
 	// weightedphraseexceptions excludes phrases from scoring at config
@@ -262,6 +318,51 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 		return err
 	}
 
+	reqSubRules := make(map[string]string)
+	for _, rule := range cfg.RequestSubstitutions {
+		reqSubRules[rule.Search] = rule.Replace
+	}
+	reqRegexSubRules := make([]proxy.RegexSubstitutionRule, 0, len(cfg.RegexRequestSubstitutions))
+	for _, rule := range cfg.RegexRequestSubstitutions {
+		reqRegexSubRules = append(reqRegexSubRules, proxy.RegexSubstitutionRule{
+			Pattern:        rule.Pattern,
+			Replace:        rule.Replace,
+			MaxWindowBytes: rule.MaxWindowBytes,
+			Source:         rule.Source,
+		})
+	}
+	reqSubstitution, err := proxy.NewSubstitutionFilterWithRegex(reqSubRules, reqRegexSubRules)
+	if err != nil {
+		return err
+	}
+	if reqSubstitution != nil {
+		reqSubstitution.LengthPreserved = true
+		reqSubstitution.OnMatch = func(kind string, pattern string) {
+			proxy.RequestSubstitutionsTotal.WithLabelValues(kind).Inc()
+			slog.Info("Request body substitution applied", slog.String("kind", kind), slog.String("pattern", pattern))
+		}
+	}
+
+	cfg.NoCheckCertSitesMatcher = proxy.NewDomainMatcher(cfg.NoCheckCertSites)
+	noCheckIPsMatcher, err := proxy.NewIPMatcher(cfg.NoCheckCertSiteIPs)
+	if err != nil {
+		return fmt.Errorf("compile nocheckcertsiteiplist: %w", err)
+	}
+	cfg.NoCheckCertSiteIPsMatcher = noCheckIPsMatcher
+
+	greySSLSitesMatcher := proxy.NewDomainMatcher(cfg.GreySSLSites)
+	greySSLIpsMatcher, err := proxy.NewIPMatcher(cfg.GreySSLSiteIPs)
+	if err != nil {
+		return fmt.Errorf("compile greysslsiteiplist: %w", err)
+	}
+	cfg.GreySSLSitesMatcher = greySSLSitesMatcher
+	cfg.GreySSLSiteIPsMatcher = greySSLIpsMatcher
+
+	server.SetGreySSLRules(greySSLSitesMatcher, greySSLIpsMatcher)
+
+	if len(cfg.NoCheckCertSites) > 0 || len(cfg.NoCheckCertSiteIPs) > 0 {
+		slog.Warn("SECURITY WARNING: SSL certificate validation is disabled for configured hosts/IPs via nocheckcertsitelist/nocheckcertsiteiplist")
+	}
 	logPhrases, err := proxy.NewPhraseFilterWithExceptions(cfg.LogPhrases, nil, cfg.ExceptionLogPhrases, 0)
 	if err != nil {
 		return err
@@ -283,6 +384,11 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 		MaxIdlePerHost: cfg.UpstreamMaxIdlePerHost,
 		IdleTimeout:    cfg.UpstreamIdleTimeout,
 	})
+	alertCats := make(map[string]bool)
+	for _, cat := range cfg.AlertCategories {
+		alertCats[cat] = true
+	}
+
 	server.SetRelayOptions(proxy.RelayOptions{
 		LogBodies:                cfg.LogBodies,
 		LogBodiesSampleRate:      cfg.LogBodiesSampleRate,
@@ -299,7 +405,11 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 		WSIdleTimeout:            cfg.WSIdleTimeout,
 		Filter:                   filter,
 		RequestFilter:            filter,
+		RequestSubstitutionFilter: reqSubstitution,
 		Policy:                   policy,
+		AccessLogger:             currentAccessLog,
+		AlertLogger:              currentAlertLog,
+		AlertCategories:          alertCats,
 	})
 	server.SetPolicy(policy)
 	accessProfiles := make([]proxy.AccessProfile, 0, len(cfg.AccessProfiles))
@@ -425,4 +535,65 @@ func logConfig(prefix string, cfg *appConfig, logger *slog.Logger) {
 		slog.Bool("dns_cache_enabled", cfg.DNSCacheEnabled),
 		slog.Duration("dns_cache_ttl", cfg.DNSCacheTTL),
 	)
+}
+
+func setupLoggerSinks(cfg *appConfig) error {
+	if cfg.AccessLog != currentAccessPath {
+		if currentAccessAH != nil {
+			oldAH := currentAccessAH
+			oldFile := currentAccessFile
+			time.AfterFunc(5*time.Second, func() {
+				oldAH.Close()
+				if oldFile != nil {
+					_ = oldFile.Close()
+				}
+			})
+		}
+		if cfg.AccessLog != "" {
+			file, err := os.OpenFile(cfg.AccessLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				return fmt.Errorf("open access log %s: %w", cfg.AccessLog, err)
+			}
+			ah := proxy.NewAsyncHandler(slog.NewJSONHandler(file, &slog.HandlerOptions{Level: slog.LevelInfo}), 10000, "access")
+			currentAccessPath = cfg.AccessLog
+			currentAccessFile = file
+			currentAccessAH = ah
+			currentAccessLog = slog.New(ah)
+		} else {
+			currentAccessPath = ""
+			currentAccessFile = nil
+			currentAccessAH = nil
+			currentAccessLog = nil
+		}
+	}
+
+	if cfg.AlertLog != currentAlertPath {
+		if currentAlertAH != nil {
+			oldAH := currentAlertAH
+			oldFile := currentAlertFile
+			time.AfterFunc(5*time.Second, func() {
+				oldAH.Close()
+				if oldFile != nil {
+					_ = oldFile.Close()
+				}
+			})
+		}
+		if cfg.AlertLog != "" {
+			file, err := os.OpenFile(cfg.AlertLog, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+			if err != nil {
+				return fmt.Errorf("open alert log %s: %w", cfg.AlertLog, err)
+			}
+			ah := proxy.NewAsyncHandler(slog.NewJSONHandler(file, &slog.HandlerOptions{Level: slog.LevelInfo}), 10000, "alert")
+			currentAlertPath = cfg.AlertLog
+			currentAlertFile = file
+			currentAlertAH = ah
+			currentAlertLog = slog.New(ah)
+		} else {
+			currentAlertPath = ""
+			currentAlertFile = nil
+			currentAlertAH = nil
+			currentAlertLog = nil
+		}
+	}
+	return nil
 }

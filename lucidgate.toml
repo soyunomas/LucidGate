@@ -1,104 +1,240 @@
-[server]
-# Escucha en todas las interfaces del PC para permitir conexiones locales y externas
-listen_addr = "0.0.0.0:8080"
-cert_dir = "certs"
-handshake_timeout = "5s"
-max_connections = 2048
-wait_timeout = "250ms"
-cert_workers = 4
-io_timeout = "10s"
-ws_idle_timeout = "5m"
+# LucidGate complete configuration reference.
+#
+# This file is intentionally comment-only: an empty TOML file is valid and keeps
+# LucidGate on its compiled defaults. Uncomment only the settings you need.
+# Durations use Go syntax: "250ms", "5s", "1m", "90s", "5m".
+# Paths are resolved relative to this file when the application loads TOML lists.
+# Environment variables use the LUCIDGATE_ prefix; CLEARGATE_ is accepted only for legacy compatibility.
 
-[upstream]
-dial_timeout = "5s"
-max_idle_conns_per_host = 32
-idle_timeout = "90s"
-insecure_skip_verify = false
+# -----------------------------------------------------------------------------
+# Server: listener, admission control, timeouts and local TLS work.
+# -----------------------------------------------------------------------------
+# [server]
+# listen_addr = "127.0.0.1:8080"          # TCP proxy listener. Use "0.0.0.0:8080" only when remote clients must connect.
+# cert_dir = "certs"                       # Directory containing/generated ca.crt and ca.key.
+# handshake_timeout = "5s"                 # Downstream TLS handshake deadline.
+# max_connections = 1024                    # Global concurrent connection limit; excess traffic gets fast backpressure.
+# wait_timeout = "250ms"                   # Max time a connection waits for an admission slot; 0 means no queue wait.
+# cert_workers = 4                          # Background MITM certificate workers. Default is runtime.NumCPU().
+# io_timeout = "30s"                       # Per read/write operation deadline for proxied HTTP traffic.
+# ws_idle_timeout = "5m"                   # Idle deadline for raw WebSocket copy after Upgrade succeeds.
+# reuseport = false                         # Enable SO_REUSEPORT listeners on supported UNIX systems.
+# circuit_breaker_enabled = true            # Stop dialing unhealthy upstream destinations temporarily.
+# circuit_breaker_failures = 5              # Consecutive failures needed to open the circuit.
+# circuit_breaker_timeout = "30s"          # Open-state duration before trying half-open again.
+# dns_cache_enabled = true                  # Enable internal DNS cache.
+# dns_cache_ttl = "60s"                    # DNS cache TTL.
+# http3_enabled = false                     # Experimental downstream HTTP/3 UDP listener. Keep false unless explicitly testing QUIC.
 
-[mitm]
-# Pre-generación de certificados al arrancar para los dominios CDN/Populares más habituales
-prewarm_hosts = [
-  "www.google.com",
-  "www.gstatic.com",
-  "www.cloudflare.com",
-  "1.1.1.1",
-  "chatgpt.com",
-  "github.com"
-]
+# -----------------------------------------------------------------------------
+# Upstream: outbound dialing and connection reuse.
+# -----------------------------------------------------------------------------
+# [upstream]
+# dial_timeout = "10s"                     # TCP/uTLS upstream dial timeout.
+# max_idle_conns_per_host = 32              # Idle upstream keep-alive pool per destination. 0 disables pooling.
+# idle_timeout = "90s"                     # How long pooled upstream sockets can stay idle.
+# insecure_skip_verify = false              # Lab only. Never enable for production interception.
 
-[logging]
-log_bodies = true
-# 8 MiB de límite de captura para cuerpos de datos
-max_capture_bytes = 8388608
-dump_dir = "dumps"
-dump_on_policy_hit = true
-# Clave criptográfica para enmascarar contraseñas/credenciales con hash HMAC-SHA256 en logs forenses
-audit_key = "clave-secreta-de-auditoria-lucidgate"
-dump_credentials_cleartext = false
+# -----------------------------------------------------------------------------
+# MITM: certificate prewarm and TLS interception bypasses.
+# -----------------------------------------------------------------------------
+# [mitm]
+# prewarm_hosts = [                         # Hostnames to pre-generate leaf certs for at startup/reload.
+#   "www.google.com",
+#   "github.com",
+#   "chatgpt.com",
+# ]
+# bypass_hosts = [                          # Hostnames that should bypass MITM inspection.
+#   "updates.example.test",
+#   "banking.example.test",
+# ]
 
-[metrics]
-# Expone la monitorización con el servidor administrativo en localhost
-enabled = true
-listen_addr = "127.0.0.1:6060"
+# -----------------------------------------------------------------------------
+# Logging and forensic payload dumps.
+# -----------------------------------------------------------------------------
+# [logging]
+# log_bodies = true                         # Capture body byte counts and optional payload dump metadata.
+# log_bodies_sample_rate = 1.0              # 0.0 to 1.0 sampling rate for body capture path.
+# max_capture_bytes = 1048576               # Max bytes captured per body for logging. 0 disables body capture.
+# dump_dir = ""                             # Non-empty path writes decompressed cleartext request/response JSONL dumps.
+# dump_on_policy_hit = false                # Only dump when a policy blocks or matches audit logging.
+# dump_credentials_cleartext = false        # Dangerous. Requires dump_on_policy_hit=true and controlled environments.
+# audit_key = "replace-with-long-random-key" # HMAC key used to correlate redacted credentials/secrets.
+# dump_max_size_mb = 100                    # Rotate dump file after this size.
+# dump_max_backups = 10                     # Number of rotated dump files to keep.
+# dump_min_free_space_mb = 1024             # Skip dumps if free space falls below this value.
+# dump_compress = true                      # Compress rotated dump files with gzip.
+# access_log = ""                           # Optional access log path.
+# alert_log = ""                            # Optional alert log path.
 
-[rules]
-# Carpeta que almacena las listas de filtrado estructuradas estilo e2guardian
-include_dir = ["rules.d"]
+# -----------------------------------------------------------------------------
+# Metrics endpoint.
+# -----------------------------------------------------------------------------
+# [metrics]
+# enabled = false                           # Expose Prometheus metrics.
+# listen_addr = "127.0.0.1:6060"           # Metrics listener. Keep localhost unless protected by network controls.
 
-[[access.profile]]
-name = "admin"
-default = true
-clients = ["0.0.0.0/0"]
+# -----------------------------------------------------------------------------
+# e2guardian-style list loading.
+# -----------------------------------------------------------------------------
+# [rules]
+# include_dir = [                           # Directories or files to load. Directories are read alphabetically.
+#   "lists/sites",
+#   "lists/downloads",
+#   "lists/http",
+#   "lists/phraselists",
+#   "lists/logging",
+#   "lists/clients",
+#   "lists/groups",
+#   "lists/time",
+# ]
 
-[[schedule.window]]
-profile = "admin"
-days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-start = "00:00"
-end = "24:00"
+# Supported list filenames under include_dir:
+# sites: bannedsitelist, exceptionsitelist, localexceptionsitelist, localgreysitelist,
+#   localsemiexceptionsitelist, localbannedsitelist, greysitelist, semiexceptionsitelist,
+#   bannedregexpsitelist, exceptionregexpsitelist, refererexceptionsitelist,
+#   bannedsiteiplist, localbannedsiteiplist, exceptionsiteiplist, localexceptionsiteiplist,
+#   refererexceptionsiteiplist, greysiteiplist, localgreysiteiplist,
+#   semiexceptionsiteiplist, localsemiexceptionsiteiplist, bannedurllist,
+#   exceptionurllist, refererexceptionurllist, localexceptionurllist, localgreyurllist,
+#   localbannedurllist, greyurllist, bannedregexpurllist, exceptionregexpurllist,
+#   urlregexplist, urlredirectregexplist, allowedtldlist, blanketblocktldlist,
+#   nocheckcertsitelist, nocheckcertsiteiplist, greysslsitelist, localgreysslsitelist,
+#   greysslsiteiplist, localgreysslsiteiplist.
+# downloads: bannedextensionlist, exceptionextensionlist, bannedmimetypelist,
+#   exceptionmimetypelist, bannedfilenamelist, exceptionfilenamelist, downloadmanager.
+# http: bannedheaderlist, exceptionheaderlist, bannedregexpheaderlist,
+#   exceptionregexpheaderlist, headerregexplist, addheaderregexplist,
+#   responseheaderregexplist, bannedcookiephraselist, exceptioncookiephraselist.
+# phraselists: bannedphraselist, oldbannedphraselist, exceptionphraselist,
+#   oldexceptionphraselist, weightedphraselist, oldweightedphraselist,
+#   weightedphraseexceptions.
+# logging: logurllist, exceptionlogurllist, logregexpurllist, exceptionlogregexpurllist,
+#   logregexpsitelist, exceptionlogregexpsitelist, logphraselist, exceptionlogphraselist,
+#   logsitelist, logsiteiplist, nologsitelist, nologsiteiplist, nologurllist,
+#   nologregexpurllist, nologextensionlist, alertcategorylist.
+# clients/groups/time: bannedclientiplist, exceptionclientiplist, filtergroupslist,
+#   e2guardianipgroups, blankettimelist, bannedtimelist.
 
-[semantic]
-# Bloqueo inmediato de payload/palabras clave e2guardian
-blocked_phrases = ["payload-malicioso-bloqueado-trie", "monja", "conejo"]
-score_threshold = 100
+# -----------------------------------------------------------------------------
+# Access profiles and schedules.
+# -----------------------------------------------------------------------------
+# [[access.profile]]
+# name = "default"                         # Profile name used by schedules and IP groups.
+# default = true                            # Default profile for clients not matched elsewhere.
+# clients = ["0.0.0.0/0", "::/0"]         # Client IP/CIDR selectors.
+# max_conns = 512                           # Optional per-profile concurrent connection cap.
+# rate_limit = 50.0                         # Optional requests/second rate. Must be paired with rate_burst.
+# rate_burst = 100                          # Optional burst capacity. Must be paired with rate_limit.
 
-[[semantic.weighted_phrase]]
-phrase = "malware"
-weight = 60
+# [[access.profile]]
+# name = "restricted"
+# clients = ["192.0.2.0/24"]
+# max_conns = 128
+# rate_limit = 10.0
+# rate_burst = 20
 
-[[semantic.weighted_phrase]]
-phrase = "credential dump"
-weight = 80
+# [[schedule.window]]
+# profile = "default"                      # Applies to an access profile name.
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# start = "08:00"
+# end = "18:00"
 
-[[semantic.weighted_phrase]]
-phrase = "exploit kit"
-weight = 60
+# [[schedule.window]]
+# profile = "restricted"
+# days = ["sat", "sun"]
+# start = "10:00"
+# end = "14:00"
 
-[masking]
-# Censura textos sensibles (como API Keys o tokens) de forma automática con asteriscos
-phrases = ["apikey-secreta-super-oculta-de-produccion"]
+# -----------------------------------------------------------------------------
+# Semantic phrase filtering.
+# -----------------------------------------------------------------------------
+# [semantic]
+# blocked_phrases = [                       # Hard-block phrases configured inline.
+#   "credential dump",
+#   "secret signing key",
+# ]
+# blocked_phrase_lists = ["lists/phraselists/bannedphraselist"]
+# exception_phrase_lists = ["lists/phraselists/exceptionphraselist"]
+# weighted_phrase_lists = ["lists/phraselists/weightedphraselist"]
+# score_threshold = 100                     # Weighted phrase score needed to block.
 
-[injection]
-# Inyección dinámica de un banner HTML justo antes del tag </body> en páginas no seguras
-html_banner = "<div style=\"position:fixed;bottom:0;left:0;right:0;background:#ef4444;color:white;text-align:center;padding:8px;z-index:99999;font-family:sans-serif;font-weight:bold;\">🛡️ LucidGate: Tráfico Interceptado e Inspeccionado Activado</div>"
+# [[semantic.weighted_phrase]]
+# phrase = "private api key"
+# weight = 70
 
-[magic]
-# Bloqueo instantáneo por cabecera MIME "magic number" de ejecutables antes de transmitirse
-blocked_types = ["executable/pe", "executable/elf"]
+# [[semantic.weighted_phrase]]
+# phrase = "production database dump"
+# weight = 90
 
-[antivirus]
-# Configuración del escáner en streaming de ClamAV (desactivado por defecto)
-enabled = false
-clamav_addr = "127.0.0.1:3310"
-temp_dir = "/tmp"
-trickle_interval = "1s"
-scan_timeout = "30s"
+# -----------------------------------------------------------------------------
+# Masking: preserve length while replacing sensitive phrases with mask bytes.
+# -----------------------------------------------------------------------------
+# [masking]
+# phrases = ["apikey-demo-value"]
+# phrase_lists = ["lists/masking/maskedphraselist"]
 
-[substitution]
-# Reglas de sustitución directa de texto en flujos mutables
-[[substitution.rule]]
-search = "Real Madrid"
-replace = "Súper Real Madrid"
+# -----------------------------------------------------------------------------
+# HTML injection: mutates eligible HTML responses.
+# -----------------------------------------------------------------------------
+# [injection]
+# html_banner = "<div style=\"position:fixed;bottom:0;left:0;right:0;background:#111;color:#fff;padding:8px;text-align:center;z-index:99999\">LucidGate inspection active</div>"
 
-[[substitution.rule]]
-search = "http://example.com"
-replace = "https://example.com"
+# -----------------------------------------------------------------------------
+# Magic-number file blocking.
+# -----------------------------------------------------------------------------
+# [magic]
+# blocked_types = ["executable/pe", "executable/elf"]
+
+# -----------------------------------------------------------------------------
+# Antivirus: ClamAV streaming scan.
+# -----------------------------------------------------------------------------
+# [antivirus]
+# enabled = false
+# clamav_addr = "127.0.0.1:3310"
+# temp_dir = "/tmp"
+# trickle_interval = "1s"                  # Client trickle cadence while scan is pending.
+# scan_timeout = "30s"                     # Maximum scan duration.
+
+# -----------------------------------------------------------------------------
+# Response/body substitution.
+# -----------------------------------------------------------------------------
+# [substitution]
+# rule_lists = ["lists/substitution/substitutionlist"]
+# regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
+
+# [[substitution.rule]]
+# search = "http://example.test"
+# replace = "https://example.test"
+
+# [[substitution.regex_rule]]
+# pattern = "(?i)api[_-]?key\\s*[:=]\\s*[A-Za-z0-9._-]+"
+# replace = "api_key=[redacted]"
+# max_window_bytes = 65536
+
+# -----------------------------------------------------------------------------
+# Request/body substitution. Use narrow DLP rules; broad request mutation can
+# break CSRF tokens, signed payloads and JSON/protobuf APIs.
+# -----------------------------------------------------------------------------
+# [request_substitution]
+# rule_lists = ["lists/substitution/requestsubstitutionlist"]
+# regex_rule_lists = ["lists/substitution/requestregexsubstitutionlist"]
+
+# [[request_substitution.rule]]
+# search = "staging-password"
+# replace = "[redacted]"
+
+# [[request_substitution.regex_rule]]
+# pattern = "(?i)(api[_-]?key=)[A-Za-z0-9._-]+"
+# replace = "${1}[redacted]"
+# max_window_bytes = 65536
+
+# -----------------------------------------------------------------------------
+# OpenTelemetry tracing.
+# -----------------------------------------------------------------------------
+# [tracing]
+# enabled = false
+# endpoint = "localhost:4317"
+# insecure = true
+# service_name = "lucidgate"
+# sample_rate = 1.0                         # 0.0 to 1.0

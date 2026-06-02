@@ -395,8 +395,14 @@ Recognized e2guardian-style site and URL files:
 - `exceptionsitelist`: allowed domain overrides.
 - `bannedregexpsitelist`: blocked domain regexes.
 - `exceptionregexpsitelist`: allowed domain regex overrides.
+- `bannedsiteiplist`: blocked destination IPs/CIDRs, checked before upstream dial for IP-literal hosts and DNS-resolved hosts.
+- `exceptionsiteiplist`: destination IP/CIDR overrides for `bannedsiteiplist`.
+- `greysiteiplist`: accepted for compatibility; it means allow the destination IP while keeping normal content inspection.
 - `bannedurllist`: blocked canonical URLs (`scheme://host/path?query`).
 - `exceptionurllist`: allowed URL overrides.
+- `refererexceptionsitelist`: allowed `Referer` domains that bypass content filters.
+- `refererexceptionsiteiplist`: allowed `Referer` IP/CIDR sources that bypass content filters.
+- `refererexceptionurllist`: allowed `Referer` URL prefixes that bypass content filters.
 - `bannedregexpurllist`: blocked URL regexes.
 - `exceptionregexpurllist`: allowed URL regex overrides.
 - `bannedextensionlist`: blocked download/request path extensions such as `.exe` or `zip`.
@@ -407,20 +413,29 @@ Recognized e2guardian-style site and URL files:
 - `exceptionfilenamelist`: allowed filename overrides.
 - `bannedheaderlist`: blocked request/response header phrases matched against `Header-Name: value`.
 - `exceptionheaderlist`: allowed header phrase overrides.
+- `bannedregexpheaderlist`: blocked request/response header regexes matched against `Header-Name: value`.
+- `exceptionregexpheaderlist`: allowed header regex overrides.
 - `bannedcookiephraselist`: blocked cookie phrases matched against `Cookie` and `Set-Cookie` values.
 - `exceptioncookiephraselist`: allowed cookie phrase overrides.
 - `bannedclientiplist`: blocked client IP addresses or CIDR prefixes.
 - `exceptionclientiplist`: allowed client IP or CIDR overrides.
 - `e2guardianipgroups`: mapping of client IPs/CIDRs to profile groups (syntax: `IP/CIDR = group`).
 - `filtergroupslist`: list of group/profile names to assign numeric indices.
+- `logsitelist`: domains to explicitly mark for auditing/logging.
+- `logsiteiplist`: literal destination IPs/CIDRs to explicitly mark for auditing/logging when the request host is already an IP.
 - `logurllist`: URLs to explicitly mark for auditing/logging.
 - `exceptionlogurllist`: URL audit logging exclusions.
 - `logregexpurllist`: URL regular expressions to mark for auditing.
 - `exceptionlogregexpurllist`: URL regex audit logging exclusions.
 - `logregexpsitelist`: domain regular expressions to mark for auditing.
 - `exceptionlogregexpsitelist`: domain regex audit logging exclusions.
+- `nologsitelist`: domain audit logging exclusions.
+- `nologsiteiplist`: literal destination IP/CIDR audit logging exclusions when the request host is already an IP.
+- `nologurllist`: URL audit logging exclusions.
+- `nologregexpurllist`: URL regex audit logging exclusions.
+- `nologextensionlist`: extension audit logging exclusions.
 
-Precedence is explicit: exceptions win over bans. For domains, `example.com` and `.example.com` both match the root domain and subdomains. Regexes are compiled during startup/reload; an invalid regex aborts that reload with `file:line` in the error. HTTP requests are checked before upstream dial. HTTPS URL rules are checked after the local MITM TLS handshake, before opening the upstream connection for the decrypted request.
+Precedence is explicit: exceptions win over bans. For domains, `example.com` and `.example.com` both match the root domain and subdomains. Regexes and IP/CIDR prefixes are compiled during startup/reload; an invalid regex or IP prefix aborts that reload with `file:line` in the error. HTTP requests are checked before upstream dial. HTTPS URL rules are checked after the local MITM TLS handshake, before opening the upstream connection for the decrypted request. Destination IP lists apply to IP-literal hosts immediately and to DNS-resolved hosts by resolving once, applying policy to that IP, then dialing the same resolved address.
 
 File/download rules are checked twice. URL path filename and extension are checked before upstream dial when possible. Response `Content-Type` and `Content-Disposition` are checked after upstream headers arrive but before LucidGate transfers the body to the client.
 
@@ -439,8 +454,14 @@ lists/
     exceptionsitelist
     bannedregexpsitelist
     exceptionregexpsitelist
+    bannedsiteiplist
+    exceptionsiteiplist
+    greysiteiplist
     bannedurllist
     exceptionurllist
+    refererexceptionsitelist
+    refererexceptionsiteiplist
+    refererexceptionurllist
     bannedregexpurllist
     exceptionregexpurllist
   downloads/
@@ -453,6 +474,8 @@ lists/
   http/
     bannedheaderlist
     exceptionheaderlist
+    bannedregexpheaderlist
+    exceptionregexpheaderlist
     bannedcookiephraselist
     exceptioncookiephraselist
   phraselists/
@@ -471,12 +494,19 @@ lists/
     e2guardianipgroups
     filtergroupslist
   logging/
+    logsitelist
+    logsiteiplist
     logurllist
     exceptionlogurllist
     logregexpurllist
     exceptionlogregexpurllist
     logregexpsitelist
     exceptionlogregexpsitelist
+    nologsitelist
+    nologsiteiplist
+    nologurllist
+    nologregexpurllist
+    nologextensionlist
     logphraselist
     exceptionlogphraselist
 ```
@@ -514,8 +544,14 @@ regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
 | Domain | `exceptionsitelist` | one domain per line | overrides domain bans |
 | Domain | `bannedregexpsitelist` | Go/RE2 regex | before upstream |
 | Domain | `exceptionregexpsitelist` | Go/RE2 regex | overrides domain regex bans |
+| Site IP | `bannedsiteiplist` | IP or CIDR per line | before upstream for IP-literal and DNS-resolved hosts |
+| Site IP | `exceptionsiteiplist` | IP or CIDR per line | overrides site IP bans |
+| Site IP | `greysiteiplist` | IP or CIDR per line | allow with normal content inspection |
 | URL | `bannedurllist` | `scheme://host/path?query` prefix | before upstream when URL is known |
 | URL | `exceptionurllist` | URL prefix | overrides URL bans |
+| Referer | `refererexceptionsitelist` | one domain per line | bypasses content filters when `Referer` host matches |
+| Referer | `refererexceptionsiteiplist` | IP or CIDR per line | bypasses content filters when `Referer` host is an IP match |
+| Referer | `refererexceptionurllist` | URL prefix | bypasses content filters when `Referer` URL matches |
 | URL | `bannedregexpurllist` | Go/RE2 regex | before upstream when URL is known |
 | URL | `exceptionregexpurllist` | Go/RE2 regex | overrides URL regex bans |
 | Downloads | `bannedextensionlist` | `.exe` or `exe` | URL path before upstream |
@@ -526,6 +562,8 @@ regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
 | Downloads | `exceptionfilenamelist` | basename | overrides filename bans |
 | HTTP | `bannedheaderlist` | substring against `Header-Name: value` | request/response headers |
 | HTTP | `exceptionheaderlist` | substring | overrides header bans |
+| HTTP | `bannedregexpheaderlist` | Go/RE2 regex against `Header-Name: value` | request/response headers |
+| HTTP | `exceptionregexpheaderlist` | Go/RE2 regex | overrides header regex bans |
 | HTTP | `bannedcookiephraselist` | substring in `Cookie`/`Set-Cookie` | request/response cookies |
 | HTTP | `exceptioncookiephraselist` | substring | overrides cookie bans |
 | Semantic | `bannedphraselist` | one phrase per line | response/request body text stream |
@@ -539,12 +577,19 @@ regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
 | Client | `exceptionclientiplist` | IP or CIDR per line | overrides client IP bans |
 | Client | `e2guardianipgroups` | `IP/CIDR = group` | maps client IPs to profile groups |
 | Client | `filtergroupslist` | group names per line | defines ordered group profiles |
+| Log | `logsitelist` | one domain per line | marks matched domains for audit logging |
+| Log | `logsiteiplist` | IP or CIDR per line | marks matched IP-literal hosts for audit logging |
 | Log | `logurllist` | URL prefix | marks matched URLs for audit logging |
 | Log | `exceptionlogurllist` | URL prefix | overrides URL audit logging |
 | Log | `logregexpurllist` | Go/RE2 regex | marks matched URLs for audit logging |
 | Log | `exceptionlogregexpurllist` | Go/RE2 regex | overrides URL audit regex logging |
 | Log | `logregexpsitelist` | Go/RE2 regex | marks matched domains for audit logging |
 | Log | `exceptionlogregexpsitelist` | Go/RE2 regex | overrides domain audit regex logging |
+| Log | `nologsitelist` | one domain per line | suppresses audit logging for matched domains |
+| Log | `nologsiteiplist` | IP or CIDR per line | suppresses audit logging for matched IP-literal hosts |
+| Log | `nologurllist` | URL prefix | suppresses URL audit logging |
+| Log | `nologregexpurllist` | Go/RE2 regex | suppresses URL regex audit logging |
+| Log | `nologextensionlist` | `.png` or `png` | suppresses audit logging for request URL extensions |
 | Log | `logphraselist` | one phrase per line | marks matched body phrases for audit logging |
 | Log | `exceptionlogphraselist` | one phrase per line | overrides body phrase audit logging |
 
@@ -613,6 +658,16 @@ end = "16:00"
 ```
 
 Use `00:00` to `24:00` for all-day access.
+
+E2Guardian-style `bannedtimelist` and `blankettimelist` files inside
+`rules.include_dir` are also accepted. Each active line uses:
+
+```text
+start_hour start_min end_hour end_min days
+```
+
+Days are e2guardian digits `0-6` (`0` = Monday, `6` = Sunday). LucidGate
+compiles these blocked time bands into per-profile schedule windows.
 
 ## Semantic Filtering
 
@@ -799,7 +854,7 @@ include_dir = ["lists/sites", "lists/phraselists"]
 score_threshold = 100
 ```
 
-Recognized filenames inside any `include_dir` entry: `bannedphraselist`, `exceptionphraselist`, `weightedphraselist`, `weightedphraseexceptions` (plus the site/url/file/header/cookie families documented above). Files with unrecognized names keep the legacy behavior and are treated as plain blocked-domain lists.
+Recognized filenames inside any `include_dir` entry: `bannedphraselist`, `exceptionphraselist`, `weightedphraselist`, `weightedphraseexceptions`, `bannedtimelist`, `blankettimelist` (plus the site/url/file/header/cookie families documented above). Files with unrecognized names keep the legacy behavior and are treated as plain blocked-domain lists.
 
 Duplicates are deduplicated when safe (identical entries) and rejected when ambiguous: a weighted phrase declared with conflicting weights, two substitution rules with the same `search`, or two regex substitution rules with the same `pattern`, all produce a clear error pointing at the offending file and line.
 

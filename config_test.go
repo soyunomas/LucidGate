@@ -376,12 +376,31 @@ func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
 	listsDir := filepath.Join(dir, "lists")
 	writeFile(t, filepath.Join(listsDir, "bannedsitelist"), "blocked.test\nlegacy-block.test\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionsitelist"), "allowed.blocked.test\n")
+	writeFile(t, filepath.Join(listsDir, "localexceptionsitelist"), "local-exempt.test\n")
+	writeFile(t, filepath.Join(listsDir, "localgreysitelist"), "local-grey.test\n")
+	writeFile(t, filepath.Join(listsDir, "localbannedsitelist"), "local-blocked.test\n")
+	writeFile(t, filepath.Join(listsDir, "greysitelist"), "grey-site.test\n")
 	writeFile(t, filepath.Join(listsDir, "bannedregexpsitelist"), `(^|\.)regex-blocked\.test$`+"\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionregexpsitelist"), `^allowed\.regex-blocked\.test$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "refererexceptionsitelist"), "trusted-ref.test\n")
+	writeFile(t, filepath.Join(listsDir, "bannedsiteiplist"), "203.0.113.0/24\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionsiteiplist"), "203.0.113.42\n")
+	writeFile(t, filepath.Join(listsDir, "refererexceptionsiteiplist"), "198.51.100.42\n")
+	writeFile(t, filepath.Join(listsDir, "greysiteiplist"), "198.51.100.0/24\n")
+	writeFile(t, filepath.Join(listsDir, "localbannedsiteiplist"), "192.0.2.0/24\n")
+	writeFile(t, filepath.Join(listsDir, "localexceptionsiteiplist"), "192.0.2.42\n")
+	writeFile(t, filepath.Join(listsDir, "localgreysiteiplist"), "2001:db8:ffff::/48\n")
 	writeFile(t, filepath.Join(listsDir, "bannedurllist"), "http://example.test/private\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionurllist"), "http://example.test/private/allowed\n")
+	writeFile(t, filepath.Join(listsDir, "refererexceptionurllist"), "https://partner-ref.test/allowed\n")
+	writeFile(t, filepath.Join(listsDir, "localexceptionurllist"), "http://example.test/local-exempt\n")
+	writeFile(t, filepath.Join(listsDir, "localgreyurllist"), "http://example.test/local-grey\n")
+	writeFile(t, filepath.Join(listsDir, "localbannedurllist"), "http://example.test/local-blocked\n")
+	writeFile(t, filepath.Join(listsDir, "greyurllist"), "http://example.test/grey\n")
 	writeFile(t, filepath.Join(listsDir, "bannedregexpurllist"), `/blocked-by-regex($|\?)`+"\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionregexpurllist"), `/blocked-by-regex\?token=ok$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "urlregexplist"), `^https://example\.com/old/(.*) => https://example.com/new/$1`+"\n")
+	writeFile(t, filepath.Join(listsDir, "urlredirectregexplist"), `^https://example\.com/redirect/google\?q=(.*) => https://www.google.com/search?q=$1`+"\n")
 	writeFile(t, filepath.Join(listsDir, "bannedextensionlist"), ".exe\nzip\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionextensionlist"), ".ok\n")
 	writeFile(t, filepath.Join(listsDir, "bannedmimetypelist"), "application/x-msdownload\n")
@@ -390,6 +409,11 @@ func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
 	writeFile(t, filepath.Join(listsDir, "exceptionfilenamelist"), "allowed.zip\n")
 	writeFile(t, filepath.Join(listsDir, "bannedheaderlist"), "x-tracker: blocked\n")
 	writeFile(t, filepath.Join(listsDir, "exceptionheaderlist"), "x-tracker: allowed\n")
+	writeFile(t, filepath.Join(listsDir, "bannedregexpheaderlist"), `(?i)^X-Device: blocked-[0-9]+$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "exceptionregexpheaderlist"), `(?i)^X-Device: blocked-42$`+"\n")
+	writeFile(t, filepath.Join(listsDir, "headerregexplist"), `^(?i)User-Agent:.*Chrome.* => User-Agent: Mozilla/5.0 (Stealth)`+"\n")
+	writeFile(t, filepath.Join(listsDir, "addheaderregexplist"), `^https://example\.com/secure => X-Secure-Add: yes`+"\n")
+	writeFile(t, filepath.Join(listsDir, "responseheaderregexplist"), `^(?i)Server:.*Apache.* => Server: LucidGate`+"\n")
 	writeFile(t, filepath.Join(listsDir, "bannedcookiephraselist"), "trackid=\n")
 	writeFile(t, filepath.Join(listsDir, "exceptioncookiephraselist"), "trackid=allowed\n")
 	writeFile(t, filepath.Join(listsDir, "custom-legacy-domains"), "legacy.test\n")
@@ -426,6 +450,69 @@ func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
 	if decision := policy.Evaluate("legacy.test", nil, "http"); !decision.Blocked {
 		t.Fatalf("legacy domain decision = %#v, want blocked", decision)
 	}
+	if decision := policy.Evaluate("203.0.113.7", nil, "http"); !decision.Blocked || decision.MatchType != "site_ip" {
+		t.Fatalf("site IP decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("203.0.113.42", nil, "http"); decision.Blocked {
+		t.Fatalf("site IP exception decision = %#v, want allowed", decision)
+	}
+	if decision := policy.Evaluate("192.0.2.7", nil, "http"); !decision.Blocked || decision.MatchType != "site_ip" {
+		t.Fatalf("local site IP decision = %#v, want blocked", decision)
+	}
+	if decision := policy.Evaluate("192.0.2.42", nil, "http"); decision.Blocked {
+		t.Fatalf("local site IP exception decision = %#v, want allowed", decision)
+	}
+	if got, want := policyConfig.SiteIPs.Grey, []string{"198.51.100.0/24", "2001:db8:ffff::/48"}; !equalStrings(got, want) {
+		t.Fatalf("SiteIPs.Grey = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Domains.LocalExceptions, []string{"local-exempt.test"}; !equalStrings(got, want) {
+		t.Fatalf("Domains.LocalExceptions = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Domains.LocalGrey, []string{"local-grey.test"}; !equalStrings(got, want) {
+		t.Fatalf("Domains.LocalGrey = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Domains.LocalBlocked, []string{"local-blocked.test"}; !equalStrings(got, want) {
+		t.Fatalf("Domains.LocalBlocked = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Domains.Grey, []string{"grey-site.test"}; !equalStrings(got, want) {
+		t.Fatalf("Domains.Grey = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.LocalExceptions, []string{"http://example.test/local-exempt"}; !equalStrings(got, want) {
+		t.Fatalf("URLs.LocalExceptions = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.LocalGrey, []string{"http://example.test/local-grey"}; !equalStrings(got, want) {
+		t.Fatalf("URLs.LocalGrey = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.LocalBlocked, []string{"http://example.test/local-blocked"}; !equalStrings(got, want) {
+		t.Fatalf("URLs.LocalBlocked = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.Grey, []string{"http://example.test/grey"}; !equalStrings(got, want) {
+		t.Fatalf("URLs.Grey = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Referer.ExceptionSites, []string{"trusted-ref.test"}; !equalStrings(got, want) {
+		t.Fatalf("Referer.ExceptionSites = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Referer.ExceptionSiteIPs, []string{"198.51.100.42"}; !equalStrings(got, want) {
+		t.Fatalf("Referer.ExceptionSiteIPs = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Referer.ExceptionURLs, []string{"https://partner-ref.test/allowed"}; !equalStrings(got, want) {
+		t.Fatalf("Referer.ExceptionURLs = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.Rewrites, []proxy.RegexRule{{Pattern: `^https://example\.com/old/(.*) => https://example.com/new/$1`, Source: filepath.Join(listsDir, "urlregexplist") + ":1"}}; len(got) != 1 || got[0].Pattern != want[0].Pattern {
+		t.Fatalf("URLs.Rewrites = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.URLs.Redirects, []proxy.RegexRule{{Pattern: `^https://example\.com/redirect/google\?q=(.*) => https://www.google.com/search?q=$1`, Source: filepath.Join(listsDir, "urlredirectregexplist") + ":1"}}; len(got) != 1 || got[0].Pattern != want[0].Pattern {
+		t.Fatalf("URLs.Redirects = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Headers.RequestRewrites, []proxy.RegexRule{{Pattern: `^(?i)User-Agent:.*Chrome.* => User-Agent: Mozilla/5.0 (Stealth)`, Source: filepath.Join(listsDir, "headerregexplist") + ":1"}}; len(got) != 1 || got[0].Pattern != want[0].Pattern {
+		t.Fatalf("Headers.RequestRewrites = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Headers.RequestAdds, []proxy.RegexRule{{Pattern: `^https://example\.com/secure => X-Secure-Add: yes`, Source: filepath.Join(listsDir, "addheaderregexplist") + ":1"}}; len(got) != 1 || got[0].Pattern != want[0].Pattern {
+		t.Fatalf("Headers.RequestAdds = %#v, want %#v", got, want)
+	}
+	if got, want := policyConfig.Headers.ResponseRewrites, []proxy.RegexRule{{Pattern: `^(?i)Server:.*Apache.* => Server: LucidGate`, Source: filepath.Join(listsDir, "responseheaderregexplist") + ":1"}}; len(got) != 1 || got[0].Pattern != want[0].Pattern {
+		t.Fatalf("Headers.ResponseRewrites = %#v, want %#v", got, want)
+	}
 	if decision := policy.Evaluate("example.test", checkReq("http://example.test/private/report?q=1"), "http"); !decision.Blocked {
 		t.Fatalf("blocked URL decision = %#v, want blocked", decision)
 	}
@@ -437,6 +524,21 @@ func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
 	}
 	if decision := policy.Evaluate("example.test", checkReq("http://example.test/blocked-by-regex?token=ok"), "http"); decision.Blocked {
 		t.Fatalf("regex exception URL decision = %#v, want allowed", decision)
+	}
+	refererReq := checkReq("http://example.test/contains-blocked-phrase")
+	refererReq.Header.Set("Referer", "https://sub.trusted-ref.test/source")
+	if decision := policy.Evaluate("example.test", refererReq, "http"); !decision.BypassFilters || decision.MatchType != "referer_site_exception" {
+		t.Fatalf("referer site exception decision = %#v, want bypass", decision)
+	}
+	refererURLReq := checkReq("http://example.test/contains-blocked-phrase")
+	refererURLReq.Header.Set("Referer", "https://partner-ref.test/allowed/path")
+	if decision := policy.Evaluate("example.test", refererURLReq, "http"); !decision.BypassFilters || decision.MatchType != "referer_url_exception" {
+		t.Fatalf("referer URL exception decision = %#v, want bypass", decision)
+	}
+	refererIPReq := checkReq("http://example.test/contains-blocked-phrase")
+	refererIPReq.Header.Set("Referer", "https://198.51.100.42/source")
+	if decision := policy.Evaluate("example.test", refererIPReq, "http"); !decision.BypassFilters || decision.MatchType != "referer_site_ip_exception" {
+		t.Fatalf("referer site IP exception decision = %#v, want bypass", decision)
 	}
 	if decision := policy.EvaluateRequest("example.test", checkReq("http://example.test/download/tool.exe"), "http"); !decision.Blocked || decision.MatchType != "extension" {
 		t.Fatalf("extension decision = %#v, want blocked", decision)
@@ -467,10 +569,102 @@ func TestLoadRulePolicyRecognizesE2GuardianSiteAndURLLists(t *testing.T) {
 	if decision := policy.EvaluateRequest("example.test", headerReq, "http"); decision.Blocked {
 		t.Fatalf("header exception decision = %#v, want allowed", decision)
 	}
+	headerReq.Header.Del("X-Tracker")
+	headerReq.Header.Set("X-Device", "blocked-7")
+	if decision := policy.EvaluateRequest("example.test", headerReq, "http"); !decision.Blocked || decision.MatchType != "header_regex" {
+		t.Fatalf("header regex decision = %#v, want blocked", decision)
+	}
+	headerReq.Header.Set("X-Device", "blocked-42")
+	if decision := policy.EvaluateRequest("example.test", headerReq, "http"); decision.Blocked {
+		t.Fatalf("header regex exception decision = %#v, want allowed", decision)
+	}
 	cookieReq := checkReq("http://example.test/")
 	cookieReq.Header.Set("Cookie", "trackid=bad")
 	if decision := policy.EvaluateRequest("example.test", cookieReq, "http"); !decision.Blocked || decision.MatchType != "cookie" {
 		t.Fatalf("cookie decision = %#v, want blocked", decision)
+	}
+}
+
+func TestLoadRulePolicyCompilesE2GuardianTimeListsToSchedules(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "bannedtimelist"), "22 0 23 59 01234\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+		AccessProfiles: []AccessProfileConfig{
+			{Name: "students", Clients: []string{"192.0.2.0/24"}},
+			{Name: "staff", Default: true, Clients: []string{"127.0.0.1"}},
+		},
+	}
+	_, err := loadRulePolicy(cfg)
+	if err != nil {
+		t.Fatalf("loadRulePolicy() error = %v", err)
+	}
+	windows := make([]proxy.ScheduleWindow, 0, len(cfg.ScheduleWindows))
+	for _, window := range cfg.ScheduleWindows {
+		windows = append(windows, proxy.ScheduleWindow{
+			Profile: window.Profile,
+			Days:    window.Days,
+			Start:   window.Start,
+			End:     window.End,
+		})
+	}
+	schedules, err := proxy.NewScheduleRules(windows)
+	if err != nil {
+		t.Fatalf("NewScheduleRules() error = %v; windows=%#v", err, cfg.ScheduleWindows)
+	}
+	mondayAllowed := time.Date(2026, 6, 1, 21, 59, 0, 0, time.Local)
+	mondayBlocked := time.Date(2026, 6, 1, 22, 30, 0, 0, time.Local)
+	saturdayAllowed := time.Date(2026, 6, 6, 22, 30, 0, 0, time.Local)
+	if !schedules.Allowed("students", mondayAllowed) {
+		t.Fatal("students should be allowed before e2guardian bannedtimelist band")
+	}
+	if schedules.Allowed("students", mondayBlocked) {
+		t.Fatal("students should be blocked inside e2guardian bannedtimelist band")
+	}
+	if schedules.Allowed("staff", mondayBlocked) {
+		t.Fatal("staff should be blocked inside e2guardian bannedtimelist band")
+	}
+	if !schedules.Allowed("students", saturdayAllowed) {
+		t.Fatal("students should be allowed on days not present in e2guardian bannedtimelist")
+	}
+}
+
+func TestLoadRulePolicyReportsInvalidE2GuardianTimeListWithLineInfo(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "blankettimelist"), "22 0 24 0 01234\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	_, err := loadRulePolicy(cfg)
+	if err == nil {
+		t.Fatal("loadRulePolicy() error = nil, want invalid blankettimelist error")
+	}
+	if !strings.Contains(err.Error(), "blankettimelist:1") || !strings.Contains(err.Error(), "invalid end hour") {
+		t.Fatalf("loadRulePolicy() error = %v, want file:line invalid end hour", err)
+	}
+}
+
+func TestLoadRulePolicyReportsInvalidRefererExceptionSiteIPWithLineInfo(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "refererexceptionsiteiplist"), "198.51.100.42\nbad-ip\n")
+
+	cfg := &appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+	_, err := loadRulePolicy(cfg)
+	if err == nil {
+		t.Fatal("loadRulePolicy() error = nil, want invalid refererexceptionsiteiplist error")
+	}
+	if !strings.Contains(err.Error(), "refererexceptionsiteiplist:2") || !strings.Contains(err.Error(), "invalid IP/CIDR") {
+		t.Fatalf("loadRulePolicy() error = %v, want file:line invalid IP/CIDR", err)
 	}
 }
 
@@ -489,6 +683,21 @@ func TestApplyRuntimeConfigRejectsInvalidPolicyRegexWithFileLine(t *testing.T) {
 	}
 }
 
+func TestApplyRuntimeConfigRejectsInvalidHeaderRegexWithFileLine(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "lists", "bannedregexpheaderlist"), "ok\n[\n")
+	cfg := appConfig{
+		ConfigPath:  filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs: []string{"lists"},
+	}
+
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	err := applyRuntimeConfig(server, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "bannedregexpheaderlist:2") {
+		t.Fatalf("applyRuntimeConfig() error = %v, want file:line header regex error", err)
+	}
+}
+
 func TestApplyRuntimeConfigRejectsInvalidSubstitutionRegex(t *testing.T) {
 	cfg := appConfig{
 		RegexSubstitutions: []RegexSubstitutionConfig{
@@ -499,6 +708,19 @@ func TestApplyRuntimeConfigRejectsInvalidSubstitutionRegex(t *testing.T) {
 	err := applyRuntimeConfig(server, &cfg)
 	if err == nil || !strings.Contains(err.Error(), "regex-sub.list:2") {
 		t.Fatalf("applyRuntimeConfig() error = %v, want source regex error", err)
+	}
+}
+
+func TestApplyRuntimeConfigRejectsInvalidRequestSubstitutionRegex(t *testing.T) {
+	cfg := appConfig{
+		RegexRequestSubstitutions: []RegexSubstitutionConfig{
+			{Pattern: `[`, Replace: "x", Source: "req-regex-sub.list:3"},
+		},
+	}
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	err := applyRuntimeConfig(server, &cfg)
+	if err == nil || !strings.Contains(err.Error(), "req-regex-sub.list:3") {
+		t.Fatalf("applyRuntimeConfig() error = %v, want request source regex error", err)
 	}
 }
 
@@ -594,6 +816,32 @@ func TestLoadRulePolicyRecognizesE2GuardianPhraseLists(t *testing.T) {
 	}
 	if got, want := cfg.SemanticWeightedExceptions, []SemanticPhraseConfig{{Phrase: "scam", Weight: 40}}; !equalWeighted(got, want) {
 		t.Fatalf("SemanticWeightedExceptions = %#v, want %#v", got, want)
+	}
+}
+
+func TestLoadRulePolicyRecognizesLegacyAliases(t *testing.T) {
+	dir := t.TempDir()
+	listsDir := filepath.Join(dir, "lists")
+	writeFile(t, filepath.Join(listsDir, "oldbannedphraselist"), "legacy hard block\n")
+	writeFile(t, filepath.Join(listsDir, "oldexceptionphraselist"), "legacy exception\n")
+	writeFile(t, filepath.Join(listsDir, "oldweightedphraselist"), "<legacy_weighted><70>\n")
+
+	cfg := &appConfig{
+		ConfigPath:        filepath.Join(dir, "lucidgate.toml"),
+		IncludeDirs:       []string{"lists"},
+		SemanticThreshold: 100,
+	}
+	if _, err := loadRulePolicy(cfg); err != nil {
+		t.Fatalf("loadRulePolicy() error = %v", err)
+	}
+	if got, want := cfg.SemanticPhrases, []string{"legacy hard block"}; !equalStrings(got, want) {
+		t.Fatalf("SemanticPhrases = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.SemanticExceptionPhrases, []string{"legacy exception"}; !equalStrings(got, want) {
+		t.Fatalf("SemanticExceptionPhrases = %#v, want %#v", got, want)
+	}
+	if got, want := cfg.SemanticWeighted, []SemanticPhraseConfig{{Phrase: "legacy_weighted", Weight: 70}}; !equalWeighted(got, want) {
+		t.Fatalf("SemanticWeighted = %#v, want %#v", got, want)
 	}
 }
 
