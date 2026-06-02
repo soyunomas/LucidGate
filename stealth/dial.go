@@ -26,8 +26,9 @@ var upstreamSessionCache = utls.NewLRUClientSessionCache(8192)
 const upstreamKeepAlive = 30 * time.Second
 
 type Dialer struct {
-	Timeout time.Duration
-	Config  *utls.Config
+	Timeout                time.Duration
+	Config                 *utls.Config
+	InsecureSkipVerifyFunc func(address, serverName string) bool
 }
 
 func DialFirefox(ctx context.Context, address, serverName string) (*utls.UConn, error) {
@@ -71,6 +72,9 @@ func (d Dialer) DialFirefox(ctx context.Context, address, serverName string) (*u
 		config = d.Config.Clone()
 	}
 	config.ServerName = serverName
+	if d.InsecureSkipVerifyFunc != nil && d.InsecureSkipVerifyFunc(address, serverName) {
+		config.InsecureSkipVerify = true
+	}
 	if len(config.NextProtos) == 0 {
 		config.NextProtos = upstreamHTTP1ALPN
 	}

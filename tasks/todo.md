@@ -1,5 +1,19 @@
 # 🗺️ ROADMAP ARQUITECTÓNICO: LucidGate -> MOTOR DE FILTRADO (E2GUARDIAN CLONE)
 
+:::info PUNTO DE REANUDACIÓN (2026-06-01)
+- **Estado Actual**: ¡Correcto! El proxy intercepta, enmascara en Pastebin (preservando longitud, evitando bloqueos de WAF y CSRF) y **bloquea síncronamente en Google AI Studio/APIs** (mediante `ErrSecretExfiltrationBlocked` y la página 403 descriptiva) para evitar romper firmas ligadas a payloads sin fugas.
+- **Archivos Clave**:
+  - `proxy/policy.go`: Define `ErrSecretExfiltrationBlocked`.
+  - `proxy/substitution_filter.go`: `multiSubstitutionStreamFilter` soporta `BlockOnMatch` y `matchedError`.
+  - `proxy/relay.go`: Determina `shouldBlockOnMatch` y gestiona la intercepción de exfiltraciones.
+  - `proxy/server.go`: Renderiza las páginas de bloqueo 403 personalizadas para exfiltración.
+  - `lists/substitution/requestregexsubstitutionlist`: Contiene el DLP quirúrgico limpio.
+- **Comando para retomar mañana**: 
+  - `go run scratch/test_proxy.go` (validador de Pastebin/formularios)
+  - `go run /home/yo/.gemini/antigravity-cli/brain/0632d3ee-2954-420a-9039-eefa07bb27da/scratch/test_ai_studio.go` (validador de AI Studio / Bloqueo API)
+- **Verificaciones previas**: `go test -v ./proxy/... -run TestRequestSubstitution`
+:::
+
 ## Plan activo - P0: Corrección de Critical Data Race + WebSocket + bloqueo HTTP/3 advertising ✅
 
 **Objetivo:** Eliminar la fuga de concurrencia en el sistema de dumper y estabilizar la suite de tests bajo el race detector de Go.
@@ -1205,7 +1219,373 @@ Objetivo: Permitir configurar el proxy para que solo escriba payloads (dumps de 
     - [x] En `proxy/server_test.go`: escribir pruebas para verificar rotación de tamaño, compresión en `.gz`, borrado de backups excedentes y comportamiento ante espacio libre bajo simulado.
   - [x] **Fase D - Documentación y Verificación**
     - [x] Ejecutar `go test ./...` para verificar el correcto funcionamiento.
-    - [x] Actualizar `README.md` y `RUNTIME_CONFIGURATION.md` con los nuevos parámetros y recomendaciones operativas.
+  - [x] Actualizar `README.md` y `RUNTIME_CONFIGURATION.md` con los nuevos parámetros y recomendaciones operativas.
 
 
+---
 
+## Plan: Ejemplos comentados de regexsubstitutionlist (2026-05-31)
+
+Objetivo: ampliar `lists/substitution/regexsubstitutionlist` con ejemplos prácticos comentados, explicando cada patrón y añadiendo 10 casos adicionales sin activar nuevas reglas por defecto.
+
+- [x] Confirmar sintaxis de listas externas y comentarios.
+- [x] Añadir los ejemplos solicitados como comentarios.
+- [x] Añadir 10 ejemplos prácticos adicionales comentados.
+- [x] Verificar que el loader sigue aceptando la lista.
+
+Resultado: `lists/substitution/regexsubstitutionlist` conserva activa solo la regla previa `ca.*sa\.png => carcasa.png`; los ejemplos nuevos quedan comentados y explicados. Verificacion: `GOCACHE=/tmp/go-build go test ./... -count=1` OK.
+
+---
+
+## Plan: Tabla de compatibilidad de listas e2guardian/LucidGate (2026-05-31)
+
+Objetivo: crear una referencia Markdown con las listas declaradas en e2guardian v5.5, su equivalente en LucidGate cuando existe y el uso de cada familia.
+
+- [x] Revisar la fuente oficial `configs/e2guardianf1.conf.in` de e2guardian v5.5.
+- [x] Cruzar equivalencias con `rules.go` y `README.md` de LucidGate.
+- [x] Crear `E2GUARDIAN_LIST_COMPATIBILITY.md` con una tabla de compatibilidad.
+- [x] Verificar que la tabla Markdown queda bien formada.
+
+Resultado: nuevo documento `E2GUARDIAN_LIST_COMPATIBILITY.md` creado en la raiz. Verificacion: chequeo `awk` de columnas Markdown OK.
+
+---
+
+## Plan maestro: Igualar cobertura e2guardian sin perder rendimiento (2026-05-31)
+
+Objetivo: cerrar progresivamente los huecos de compatibilidad frente a e2guardian v5.5, empezando por las listas mas faciles y de menor riesgo, sin degradar las cualidades actuales de LucidGate: streaming, baja latencia, fast-fail, hot reload con snapshots inmutables, buffers reciclados y cero locks en el hot path.
+
+### Invariantes de rendimiento y robustez
+
+- [ ] Mantener prohibido `io.ReadAll`/`ioutil.ReadAll` para cuerpos de red. Cualquier nueva inspeccion o mutacion debe ser streaming o pre-body.
+- [ ] Compilar regex, CIDR, TLD, search extractors y reglas de rewrite durante startup/reload; nunca compilar en request path.
+- [ ] Publicar toda politica nueva como snapshot inmutable via `atomic.Value`; nada de `sync.RWMutex` para leer reglas en el hot path.
+- [ ] Preservar fast-fail: dominio, IP destino, URL, header, TLD, referer y redirect deben decidirse antes de abrir upstream cuando sea posible.
+- [ ] Para listas IP/CIDR grandes, usar estructura LPM eficiente (`bart.Table`/`netip`) en vez de busqueda lineal si hay riesgo de escala.
+- [ ] No mutar JS/CSS/SSE/media/range salvo ruta especifica segura. Mantener HTML/text/plain/JSON/XML como superficie mutable por defecto.
+- [ ] Mantener `sync.Pool` y `copyBufferPooled*` en copias de cuerpo; ninguna feature puede introducir buffers grandes por conexion.
+- [ ] Cualquier rewrite que cambie longitud de body debe eliminar/recalcular `Content-Length` y usar chunked solo donde el protocolo lo permita.
+- [ ] Cada fase debe terminar con tests unitarios, tests de reload, smoke/e2e de politica, busqueda anti-`ReadAll`, y al menos benchmark/smoke de rendimiento si toca path caliente.
+
+### Puerta base antes de implementar nuevas listas
+
+- [ ] Capturar baseline actual reproducible:
+  - `GOCACHE=/tmp/go-build go test ./... -count=1`.
+  - `GOCACHE=/tmp/go-build go test -race ./proxy ./stealth ./pki` si la fase toca concurrencia/reload.
+  - Benchmark de streaming 10 GiB existente.
+  - `make p0-smoke` o bateria equivalente si hay cambios en relay/policy.
+  - `go run scripts/load_proxy_smoke.go` con escenario HTTP local y metricas `p50/p95/p99/RPS/RSS/FDs/goroutines`.
+- [ ] Guardar numeros de baseline en este bloque antes de tocar codigo de compatibilidad nueva.
+- [ ] Definir umbral de regresion: una fase falla si sube >10% CPU/byte, allocations/op o p99 en el smoke comparable sin justificacion tecnica clara.
+- [ ] Mantener `E2GUARDIAN_LIST_COMPATIBILITY.md` como matriz viva: cada nueva lista pasa de "Sin equivalente directo/Parcial" a "Implementado" con notas reales.
+
+### Fase 1 - Compatibilidad facil, sin mutacion de cuerpos
+
+Prioridad: alta. Riesgo: bajo. Estas listas son parsing + decision pre-body/header y no deberian afectar el throughput de transferencia.
+
+- [x] **Regex de headers e2guardian.**
+  - [x] Implementar `bannedregexpheaderlist` y `exceptionregexpheaderlist`.
+  - [x] Mantener `bannedheaderlist`/`exceptionheaderlist` como substring rapido.
+  - [x] Compilar regex en reload con errores `file:line`.
+  - [x] Evaluar request headers antes de upstream y response headers antes de enviar al cliente.
+  - [x] Verificar precedencia: exception regex/header > banned regex/header.
+  - **Resultado Fase 1.1:** `HeaderRulesConfig` acepta `BlockRegex`/`ExceptionRegex`, `loadRulePolicy` reconoce los dos ficheros e2guardian y `NewPolicy` aborta reload/startup con errores `file:line` si una regex no compila. Verificacion: tests focalizados OK, `GOCACHE=/tmp/go-build go test ./... -count=1` OK, `rg "io\\.ReadAll|ioutil\\.ReadAll" proxy main.go config.go rules.go --glob '!**/*_test.go'` sin resultados.
+
+- [x] **Logs de dominio literal y no-log basico.**
+  - [x] Implementar `logsitelist` y `logsiteiplist` como auditoria sin bloqueo.
+  - [x] Implementar `nologsitelist`, `nologsiteiplist`, `nologurllist`, `nologregexpurllist`, `nologextensionlist` como supresores de log/auditoria.
+  - [x] Mantener estructura separada de block policy para no mezclar decisiones de seguridad con observabilidad.
+  - **Resultado Fase 1.2:** `LogRules` soporta dominios literales via trie, IPs/CIDR con BART para hosts que ya son IP literales, y supresores `nolog*` evaluados antes de las reglas positivas de auditoria. `logsiteiplist`/`nologsiteiplist` invalidos fallan con `file:line`. Verificacion: tests focalizados OK, `GOCACHE=/tmp/go-build go test ./... -count=1` OK, `GOCACHE=/tmp/go-build go test -race ./proxy -run 'TestPolicyLogRules|TestWriteResponseStreamingDumpsOnlyOnPolicyHit|TestServeHTTPPlainHTTPBlocksDeniedHeaderBeforeDial' -count=1` OK, `rg "io\\.ReadAll|ioutil\\.ReadAll" proxy main.go config.go rules.go --glob '!**/*_test.go'` sin resultados.
+
+- [x] **IP destino site lists.**
+  - [x] Primer corte seguro: implementar `bannedsiteiplist`, `exceptionsiteiplist`, `greysiteiplist` y aliases locales sobre hosts que ya son IP literales.
+  - [x] Evaluar IP literal antes de dial con LPM eficiente (`bart.Table`/`netip`) y snapshot inmutable.
+  - [x] `greysiteiplist` queda como compatibilidad "allow with normal content inspection"; no bloquea ni bypassa filtros.
+  - [x] Integrar decision sobre IP destino resuelta reutilizando el resultado de resolucion para el dial, sin doble DNS ni conexion upstream prematura.
+  - [x] Si el host requiere DNS, evaluar tras resolucion y antes de conectar.
+  - **Resultado Fase 1.3a:** `PolicyConfig.SiteIPs` compila `bannedsiteiplist`, `exceptionsiteiplist`, `greysiteiplist` y aliases `local*siteiplist` en tablas LPM `bart.Table` durante reload/startup. La decision se evalua antes de dial cuando el host de la request ya es una IP literal; las excepciones ganan sobre banned y grey conserva el pipeline normal de inspeccion. La integracion con IP resuelta por DNS queda como Fase 1.3b para reutilizar el resolver cacheado sin doble DNS. Verificacion: tests focalizados OK, `GOCACHE=/tmp/go-build go test ./... -count=1` OK, `GOCACHE=/tmp/go-build go test -race ./proxy -run 'TestPolicySiteIPRules|TestPolicyLogRules' -count=1` OK, `rg "io\\.ReadAll|ioutil\\.ReadAll" proxy main.go config.go rules.go --glob '!**/*_test.go'` sin resultados.
+  - **Resultado Fase 1.3b:** `resolveDialAddress` fuerza una unica resolucion DNS cuando hay listas site IP, evalua la IP resuelta contra el snapshot de politica y pasa esa misma direccion resuelta al dialer. Cubierto en HTTP plano, HTTPS MITM H1, bypass MITM y H2 upstream; los errores de politica vuelven como bloqueo 403, no como fallo upstream 502. Verificacion focalizada OK: `TestDNSResolverResolveAddrForPolicyCanForceLookup`, `TestServeHTTPPlainHTTPBlocksResolvedSiteIPBeforeDial`, `TestServeHTTPPlainHTTPDialsResolvedAddressOnceForSiteIPPolicy`, `TestAcquireHTTPSUpstreamBlocksResolvedSiteIPBeforeDial`, `TestPolicySiteIPRules`. Verificacion final: `GOCACHE=/tmp/go-build go test ./... -count=1` OK, `GOCACHE=/tmp/go-build go test -race ./proxy -run 'TestDNSResolverResolveAddrForPolicyCanForceLookup|TestServeHTTPPlainHTTPBlocksResolvedSiteIPBeforeDial|TestServeHTTPPlainHTTPDialsResolvedAddressOnceForSiteIPPolicy|TestAcquireHTTPSUpstreamBlocksResolvedSiteIPBeforeDial|TestPolicySiteIPRules|TestPolicyLogRules' -count=1` OK, anti-`ReadAll` sin resultados.
+
+- [x] **Aliases locales simples.**
+  - Reconocer `localexceptionsitelist`, `localexceptionurllist`, `localbannedsitelist`, `localbannedurllist`.
+  - Mapearlos a las estructuras actuales, pero conservando precedencia e2guardian documentada: local exception > local grey > local banned > main exception > main grey > main banned.
+  - Para el primer incremento, si `grey` aun no existe, registrar decision "allow with content inspection" usando el pipeline normal.
+  - **Resultado:** Implementados todos los aliases locales simples y listas `grey*`/`localgrey*` de URL/sitios con la precedencia completa. Añadidos tests exhaustivos en `policy_test.go` y `config_test.go` para validar los 6 niveles de precedencia para dominios y URLs. Verificación de tests exitosa y anti-`ReadAll` OK.
+
+### Fase 2 - Rewrites de headers, la mutacion mas segura
+
+Prioridad: alta. Riesgo: medio-bajo. No toca body, pero puede romper protocolos si se reescriben hop-by-hop headers sin control.
+
+- [x] **Request header rewrite: `headerregexplist`.**
+  - Sintaxis compatible `pattern => replace`, aplicada linea a linea sobre `Header-Name: value`.
+  - Permitir reemplazo vacio para eliminar header.
+  - Bloquear por defecto mutaciones peligrosas de framing (`Content-Length`, `Transfer-Encoding`, `Host`, `Connection`) salvo lista explicita futura.
+  - Aplicar antes de `writeRequestHeader`.
+  - Tests: elimina `Cookie`, cambia `User-Agent`, respeta multiples valores, no toca body.
+  - **Resultado:** Implementado con la compilación segura y el filtrado por expresión regular.
+
+- [x] **Request header add: `addheaderregexplist`.**
+  - Anadir headers condicionados por URL/host/header segun formato e2guardian si se confirma en ejemplos reales.
+  - Si el formato e2guardian resulta ambiguo, documentar dialecto LucidGate y mantenerlo en fichero separado.
+  - Tests: no duplica headers no-idempotentes salvo configuracion explicita.
+  - **Resultado:** Soporta adiciones incondicionales (`Key: Val`) y condicionales (`pattern => Key: Val`) verificadas contra el URL en la petición.
+
+- [x] **Response header rewrite: `responseheaderregexplist`.**
+  - Aplicar tras recibir headers upstream y antes de `writeResponseHeader`.
+  - Permitir eliminar tracking/security headers solo por regla explicita.
+  - No permitir cambios incoherentes de framing si el body no se transforma.
+  - **Resultado:** Aplicado directamente sobre las cabeceras de respuesta inmediatamente después de ser leídas del upstream, con el mismo nivel de protección para el framing.
+
+### Fase 3 - URL rewrite y redirect antes de upstream
+
+Prioridad: alta. Riesgo: medio. Es e2guardian visible para safe search y redireccion, pero debe conservar fast-fail.
+
+- [x] **`urlregexplist`.**
+  - Reescribir URL canonica antes de policy final y antes de upstream dial.
+  - Recalcular `Host`, target address y request URI de forma estructurada con `net/url`; evitar string hacking.
+  - Caso inicial recomendado: safe-search/query-param rewrites en mismo host.
+  - Guardrail: bloquear cambios cross-host en `urlregexplist`; usar `urlredirectregexplist` para eso.
+  - **Resultado:** Implementado con el recalculado automático y seguro mediante `net/url` y el guardrail de preservación de host.
+
+- [x] **`urlredirectregexplist`.**
+  - Responder al cliente con `302`/`307` configurable sin abrir upstream.
+  - Mantener counters/metrics de redirect y audit log.
+  - Tests HTTP plano + HTTPS MITM: redirect antes de dial upstream.
+  - **Resultado:** Implementado con fast-fail inmediato, devolviendo directamente la respuesta HTTP 302 sin levantar conexiones upstream.
+
+- [ ] **`sslsiteregexplist`.**
+  - Implementar solo si hay caso real: cambiar target upstream conservando SNI/URL original puede romper TLS y Host.
+  - Exigir tests e2e con upstream preparado que acepte Host original.
+  - Feature flag por defecto off si el riesgo operativo es alto.
+
+### Fase 4 - Semantica e2guardian de local/grey/semi-exception/storyboard
+
+Prioridad: media. Riesgo: medio-alto por precedencia y expectativas de producto.
+
+- [x] **Grey lists completas.**
+  - Implementar `greysitelist`, `greyurllist`, `greyssl*`, `localgrey*` como "permitir fetch pero mantener inspeccion de contenido".
+  - Diferenciar el comportamiento: `exceptions` activan `BypassFilters` en el contexto de transacción, mientras que `grey` y default activan inspección forzada/estándar.
+  - Añadidos tests unitarios exhaustivos de paso y bypass en `proxy/policy_test.go`.
+
+- [x] **Semi-exception.**
+  - Implementar `semiexceptionsitelist`, `semiexceptionsiteiplist`, `localsemiexceptionsitelist`, `localsemiexceptionsiteiplist`.
+  - Implementado como aliases funcionales de grey lists en `rules.go`: los ficheros se cargan en `policy.Domains.Grey` / `policy.SiteIPs.Grey` respectivamente.
+  - Semántica: permite fetch manteniendo inspección de contenido (idéntico a grey en LucidGate).
+  - Documentado en `E2GUARDIAN_LIST_COMPATIBILITY.md` con nota de diferencia vs storyboard original.
+
+- [x] **TLD blanket.**
+  - Implementar `allowedtldlist` y `blanketblocktldlist` sobre host normalizado.
+  - Evaluacion O(1) de ultra-rendimiento con escaneo inverso in-place del host.
+  - Precedencia: exception/grey pueden override como en e2guardian.
+
+- [x] **Blanket/time lists.**
+  - Mapear `blankettimelist` y `bannedtimelist` al motor `[schedule.window]`.
+  - Si el formato e2guardian difiere, crear parser compatible y compilarlo a schedules existentes.
+  - **Plan 2026-06-01:** implementar el formato e2guardian nativo `<start hour> <start minute> <end hour> <end minute> <days>` con dias `0-6`, compilandolo a ventanas de schedule por perfil sin tocar el relay. `bannedtimelist` debe bloquear fuera de las ventanas permitidas; `blankettimelist` se mapeara al mismo bloqueo temporal por ahora, documentando que LucidGate no tiene storyboard de "solo excepciones" separado. Criterio de exito: parser con errores `file:line`, hot reload via `applyRuntimeConfig`, bloqueo pre-upstream por schedule y matriz de compatibilidad actualizada.
+  - **Resultado 2026-06-01:** `rules.go` reconoce `bannedtimelist` y `blankettimelist` en `include_dir`, parsea el formato e2guardian `start_hour start_min end_hour end_min days` con dias `0-6` (`0` lunes, `6` domingo), valida errores con `file:line` y convierte las franjas bloqueadas al complemento de ventanas `[schedule.window]` por perfil. Si ya existian ventanas TOML, las intersecta con el complemento para no abrir acceso fuera de la planificacion existente. `blankettimelist` queda mapeado al mismo bloqueo temporal porque LucidGate no tiene storyboard separado de "solo excepciones". Verificacion: tests focalizados OK, `GOCACHE=/tmp/go-build go test ./... -count=1` OK, race focalizado OK, anti-`ReadAll` sin resultados, benchmarks de dominio/streaming OK. Curl e2e con proxy real + upstream local OK: lunes bloqueado por `0 0 23 59 0` devolvio `403 Access outside allowed schedule`; tras cambiar a sabado `0 0 23 59 5` y recargar por `SIGHUP`, el mismo request devolvio `200`.
+
+### Fase 5 - Referer, deep URL analysis y URLs embebidas
+
+Prioridad: media. Riesgo: medio por coste CPU si se hace ingenuamente.
+Ver detalles de alto rendimiento en [Plan de Listas](file:///home/yo/.gemini/antigravity-cli/brain/528a637c-af64-45c2-b0b2-d1c3f4838c42/implementation_plan_missing_lists_performance.md).
+
+- [x] **Referer exception lists.**
+  - Implementar `refererexceptionsitelist`, `refererexceptionsiteiplist`, `refererexceptionurllist`.
+  - Evaluar solo el header `Referer` parseado con `net/url`.
+  - No usar regex salvo lista regex futura.
+  - **Plan 2026-06-01:** completar el hueco existente de `RefererRules` sin tocar el relay: cargar las tres listas desde `include_dir`, normalizar el `Referer` con `net/url`, comprobar host por trie de dominios, host IP por tabla BART y URL por prefijo usando el matcher actual. La decision solo podra activar `BypassFilters`; no debe bloquear ni overridear un bloqueo previo de dominio/URL/header/cookie.
+  - **Resultado 2026-06-01:** `rules.go` reconoce `refererexceptionsitelist`, `refererexceptionsiteiplist` y `refererexceptionurllist`; `proxy/policy.go` compila dominios en trie, IP/CIDR en BART y URLs normalizadas por prefijo. La decision solo activa `BypassFilters` y no gana contra bloqueos previos de destino. Durante el smoke curl real se detecto y corrigio una fuga de integracion en HTTP plano: `handlePlainHTTP` calculaba `BypassFilters` pero no lo propagaba al contexto, mientras HTTPS ya lo hacia en el relay. Verificacion: tests focalizados OK, `GOCACHE=/tmp/go-build go test ./... -count=1` OK, race focal OK fuera del sandbox, anti-`ReadAll` sin resultados. Curl e2e con proxy real + upstream local OK: sin `Referer` permitido el cuerpo quedo truncado en `blocked phrase` y el log marco bloqueo; con `Referer: https://trusted-ref.test/source` el mismo contenido llego completo (`blocked phrase from upstream`) y el log marco `status=200`.
+
+- [ ] **Embedded referer lists.**
+  - Implementar `embededreferersitelist`, `embededreferersiteiplist`, `embededrefererurllist`.
+  - Extraer URL embebida solo cuando host/url coincide con listas de activacion en Radix Tree / Trie para evitar coste global.
+  - Limitar longitud maxima de URL inspeccionada.
+
+- [ ] **Deep URL analysis.**
+  - Extraer URLs dentro de query params solo si `deepurlanalysis=true`.
+  - Decodificación in-place usando buffers reutilizables vía `sync.Pool` para evitar allocations en el heap.
+  - Reutilizar policy URL/site existente sobre URLs extraidas.
+
+### Fase 6 - Search term filtering
+
+Prioridad: media. Riesgo: medio. Alto valor funcional, pero facil crear falsos positivos si se mezcla con frases generales.
+Ver detalles de alto rendimiento en [Plan de Listas](file:///home/yo/.gemini/antigravity-cli/brain/528a637c-af64-45c2-b0b2-d1c3f4838c42/implementation_plan_missing_lists_performance.md).
+
+- [ ] **`searchregexplist` y `searchexceptionregexplist`.**
+  - Compilar extractores regex en reload.
+  - Extraer terminos de busqueda sin allocations masivas (in-place query parsing) y con limite de bytes.
+  - Excepciones evaluadas antes de extraer.
+
+- [ ] **Metodo 1: listas de combinaciones.**
+  - Implementar `bannedsearchlist`, `bannedsearchoveridelist`, `localbannedsearchlist`.
+  - Normalizar terminos, ordenar tokens utilizando stack allocation y comparar contra set precompilado.
+  - Tests con `girl+sexy` estilo e2guardian.
+
+- [ ] **Metodo 2: phrase scoring especifico de busqueda.**
+  - Implementar `bannedsearchtermlist`, `weightedsearchtermlist`, `exceptionsearchtermlist`.
+  - Reusar DFA/Aho-Corasick actual con filtro separado de ultra-rendimiento y umbral `searchtermlimit`.
+  - No mezclar por defecto con weighted phrases generales para evitar falsos positivos.
+
+### Fase 7 - Antivirus exceptions y scan policy
+
+Prioridad: media-baja. Riesgo: medio por seguridad.
+Ver detalles de alto rendimiento en [Plan de Listas](file:///home/yo/.gemini/antigravity-cli/brain/528a637c-af64-45c2-b0b2-d1c3f4838c42/implementation_plan_missing_lists_performance.md).
+
+- [ ] Implementar `exceptionvirusmimetypelist`, `exceptionvirusextensionlist`, `exceptionvirussitelist`, `exceptionvirussiteiplist`, `exceptionvirusurllist`.
+- [ ] Aplicar antes de activar el escáner, activando bypass directo (Zero-Copy) si coincide.
+- [ ] Loguear claramente `antivirus_skipped_by_policy=true`.
+- [ ] Mantener default seguro: no saltar antivirus salvo lista explicita.
+
+### Fase 8 - Extension LucidGate: request body substitution
+
+Prioridad: media-baja. Riesgo: alto si se implementa sin disciplina de streaming/framing. No es una lista e2guardian v5 implementada, pero aporta una capacidad util para DLP, normalizacion de formularios y sustituciones controladas en APIs internas.
+
+- [x] **Listas nuevas dedicadas.**
+  - `requestsubstitutionlist`: sustitucion literal `search => replace` sobre cuerpos enviados por el cliente.
+  - `requestregexsubstitutionlist`: sustitucion regexp `pattern => replace`, con captures `$1`, ventana acotada y `max_window_bytes`.
+  - TOML dedicado: `[request_substitution] rule_lists = [...]`, `regex_rule_lists = [...]` y `[[request_substitution.rule]]` / `[[request_substitution.regex_rule]]`.
+  - No reutilizar `substitutionlist` para evitar activar mutacion de uploads por accidente.
+
+- [x] **Superficie segura por defecto.**
+  - Solo aplicar a `POST`, `PUT`, `PATCH`.
+  - Solo tipos mutables: `text/*`, `application/json`, `application/xml`, `application/x-www-form-urlencoded` y equivalentes ya permitidos por `isMutableRequestContentType`.
+  - Excluir siempre `multipart/*`, binarios, media, SSE, WebSocket, CONNECT raw y uploads comprimidos no soportados.
+  - Por defecto desactivado si no hay listas explicitas.
+
+- [x] **Streaming y framing.**
+  - Integrar en `writeRequestStreaming` despues del filtro semantico, sin buffering total.
+  - Reusar el motor de `SubstitutionFilter` si es posible, pero separar configuracion y metricas.
+  - Si cualquier regla puede cambiar longitud, no reenviar el `Content-Length` original.
+  - Para HTTP/1.1 upstream, usar `Transfer-Encoding: chunked` cuando el request original no permita recalcular longitud sin buffering.
+  - Si el upstream/protocolo no acepta chunked request bodies en un caso concreto, fallback seguro: no mutar y loguear `request_substitution_skipped=framing`.
+  - Mantener deadlines por operacion y buffers de `sync.Pool`.
+
+- [x] **Orden de filtros.**
+  - Politicas pre-dial siguen antes de abrir upstream.
+  - Request semantic/log inspection mantiene capacidad de bloqueo/auditoria.
+  - Request substitution solo ocurre si la request ya paso politica y se va a enviar upstream.
+  - Redaccion forense de dumps sigue independiente: no usar substitution como mecanismo de privacidad de logs.
+
+- [x] **Observabilidad.**
+  - Metricas: `lucidgate_request_substitutions_total{kind="literal|regex"}` y `lucidgate_request_substitution_skipped_total{reason}`.
+  - Logs estructurados solo con nombre/lista/regla, nunca con el valor sensible completo sustituido.
+  - Actualizar `E2GUARDIAN_LIST_COMPATIBILITY.md` indicando que es extension propia de LucidGate.
+
+- [x] **Tests requeridos.**
+  - Literal y regex con captures en `application/json` y `application/x-www-form-urlencoded`.
+  - Match partido entre chunks.
+  - `Content-Length` original eliminado o framing chunked correcto cuando cambia longitud.
+  - No muta multipart/binario/comprimido no soportado.
+  - HTTP plano y HTTPS MITM.
+  - Hot reload de listas, duplicados y regex invalida con `file:line`.
+  - Benchmark comparando upload grande sin reglas vs con reglas que no matchean para validar overhead acotado.
+
+### Fase 9 - MITM/cert compatibility
+
+Prioridad: media-baja. Riesgo: alto si se debilita seguridad TLS.
+
+- [x] **`nocheckcertsitelist` y `nocheckcertsiteiplist`.**
+  - Permitir desactivar validacion upstream por host/IP solo de forma explicita.
+  - Emitir warning de seguridad en startup/reload si hay entradas.
+  - Mantener `insecure_skip_verify=false` global como default.
+
+- [x] **Grey SSL y MITM scope.**
+  - Afinar `greysslsitelist`, `greysslsiteiplist`, `localgreysslsitelist`, `localgreysslsiteiplist`.
+  - Integrar con `mitm.bypass_hosts` sin romper zero-copy CONNECT bypass.
+  - Tests: pinned/bypass sigue siendo tunel crudo; grey entra en MITM solo cuando corresponde.
+
+### Fase 10 - Logging avanzado y alertas
+
+Prioridad: baja. Riesgo: bajo-medio por I/O.
+
+- [x] Implementar `alertcategorylist`.
+- [x] Separar `access.log`/`alert.log` conceptual en sinks configurables de `slog`.
+- [x] Mantener escritura async/acotada; no bloquear el relay por I/O de logging.
+- [x] Exponer metricas por categoria y resultado.
+
+### Fase 11 - Compatibilidad legacy/obsoleta
+
+Prioridad: baja. Riesgo: bajo si son aliases.
+
+- [x] Reconocer `oldbannedphraselist`, `oldweightedphraselist`, `oldexceptionphraselist` como aliases o parser legacy documentado.
+- [x] Documentar listas e2guardian obsoletas que LucidGate decide no implementar.
+- [x] Mantener errores accionables para formatos antiguos no soportados.
+
+### Fuera de alcance inicial o extension propia
+
+- [ ] Mutacion de request body en multipart/form-data con ficheros: no abordar hasta tener un parser streaming multipart con limites duros y pruebas de uploads grandes.
+- [ ] Mutacion de payloads comprimidos cuando cambie longitud: no abordar hasta tener recompression streaming validada para uploads y politica clara de `Content-Encoding`.
+- [ ] Mutacion de WebSocket messages: requiere parser de frames y backpressure especifico; no mezclar con request body HTTP.
+
+### Orden propuesto de ejecucion
+
+1. Fase 1.1: `bannedregexpheaderlist` / `exceptionregexpheaderlist`. (Done)
+2. Fase 1.2: `logsitelist` literal + familia `nolog*`. (Done)
+3. Fase 1.3: `bannedsiteiplist` / `exceptionsiteiplist`. (Done)
+4. Fase 2.1: `headerregexplist` para eliminar/modificar request headers. (Done)
+5. Fase 2.2: `addheaderregexplist`. (Done)
+6. Fase 2.3: `responseheaderregexplist`. (Done)
+7. Fase 3.1: `urlredirectregexplist`. (Done)
+8. Fase 3.2: `urlregexplist` limitado a mismo host. (Done)
+9. Fase 8.1: `requestsubstitutionlist` literal solo para tipos mutables.
+10. Fase 8.2: `requestregexsubstitutionlist` con ventana acotada.
+11. Fases 4-7 y 9-11 segun necesidades reales y resultado de benchmarks.
+
+### Verificacion obligatoria por fase
+
+- [ ] Parser/list-loader con includes, comentarios, directorios, duplicados y errores `file:line`.
+- [ ] Tests de precedencia y hot reload (`SIGHUP`/`applyRuntimeConfig`) para cada familia nueva.
+- [ ] Tests HTTP plano y HTTPS MITM si la lista afecta URLs/headers/respuestas.
+- [ ] Tests de no-regresion: WebSocket, Alt-Svc strip, HTTP/3, dump selectivo y filtros existentes.
+- [ ] `GOCACHE=/tmp/go-build go test ./... -count=1`.
+- [ ] Race test si toca snapshots, reload, caches o logging async.
+- [ ] `rg "io\\.ReadAll|ioutil\\.ReadAll" proxy main.go config.go rules.go`.
+- [ ] Benchmark/smoke comparable contra baseline; documentar p99/RPS/allocs si toca hot path.
+
+## [Sesión 2026-06-01] Soporte Robustecido para Request Body Substitution y Prevención de Fugas a Pastebin
+
+### Plan de Acción
+- [x] **Analizar y planificar**: Analizar el comportamiento del proxy y verificar por qué los secretos del ejemplo del usuario no se sustituyen. (Hipótesis confirmada: No existen reglas para estos secretos en `requestregexsubstitutionlist`).
+- [x] **Escribir Tests de Reproducción**: Crear casos de prueba en `proxy/request_substitution_test.go` utilizando exactamente el texto del usuario para peticiones `application/json`, `text/plain` y `application/x-www-form-urlencoded`.
+- [x] **Diseñar y Añadir Nuevas Reglas Regex**:
+  - Añadir reglas robustas para `Password: <secret>` (tanto texto plano, JSON como URL-encoded).
+  - Añadir reglas para Google Cloud Tokens (`ya29...`).
+  - Añadir reglas para Vault Tokens (`s....`).
+  - Añadir reglas para OpenAI API Keys (`sk-proj-...`).
+  - Añadir `NEXUS` al filtro de proyectos.
+- [x] **Resolver e Interceptar Exfiltración Multipart**:
+  - Habilitar de forma selectiva y segura el Content-Type `multipart/form-data` en `shouldSubstituteRequest`.
+  - Actualizar `TestRequestSubstitutionExclusions` para asegurar que `multipart/form-data` es interconectada y sustituida, mientras que otras variantes como `multipart/mixed` son omitidas de forma segura.
+  - Añadir `Test 3: Multipart Form Data` en `TestRequestSubstitutionPastebinExfiltration` para garantizar robustez E2E ante peticiones de formulario multipart.
+- [x] **Ejecutar Pruebas y Verificar**: Ejecutar `make test` para verificar que la suite de pruebas funciona.
+- [x] **E2E Curl/Mock Validation**: Crear, compilar y ejecutar un script local que simule tanto peticiones urlencoded como multipart con datos confidenciales a través del proxy LucidGate, confirmando su total enmascaramiento.
+- [x] **Documentar Lecciones**: Actualizar `tasks/lessons.md` si es necesario.
+
+## [Sesión de Corrección: Compatibilidad WAF (Pastebin) y JSON (Google AI Studio)]
+
+### Problema Reportado
+- Al habilitar la intercepción de peticiones e incluir listas completas de sustitución, se produjeron fallos graves:
+  1. **Pastebin**: Retornaba el error `Unable to verify your data submission` al enviar pastes desde Firefox.
+  2. **Google AI Studio**: Retornaba error de tipo `Malformed JSON` al escribir prompts en el navegador.
+
+### Análisis y Solución
+- **Causa Raíz 1 (Pastebin)**: Las reglas de sustitución por expresión regular cargadas contenían una regla sumamente agresiva e inespecífica (Regla 37) que coincidía con cualquier parámetro HTTP que contuviera la palabra `token` (como `csrf_token_name` de Pastebin) y redactaba su valor, rompiendo la validación de CSRF upstream de Cloudflare/WAF.
+- **Causa Raíz 2 (AI Studio)**: Reglas de enmascaramiento genéricas (como Regla 1 para `password` y Regla 21 para `id` de usuario en JSON) modificaban claves estructurales y valores numéricos en los payloads JSON, y al forzar preservación de longitud (`padOrTruncate`), truncaban las comillas de cierre o rellenaban números con asteriscos, corrompiendo la sintaxis JSON a nivel global.
+- **Solución Quirúrgica Realizada**:
+  - Se mantuvieron estrictamente **comentadas** todas las reglas de inyección genéricas o experimentales (Burp-style) de `requestsubstitutionlist` y `requestregexsubstitutionlist`.
+  - Se configuró el proxy en modo **DLP de Alta Fidelidad**, enfocando las sustituciones exclusivamente en las firmas específicas de secretos de infraestructura (tokens de GCP, tokens de Vault con longitud dinámica de 20-40 bytes, contraseñas específicas soportando URL-encoding del símbolo `!`, API keys de OpenAI, e identificadores de proyecto).
+  - Se validó el comportamiento mediante `go run scratch/test_proxy.go`, obteniendo un paso perfecto (`🎉 ALL SENSITIVE DATA INTERCEPTED AND REDACTED SUCCESSFULLY!`) en flujos de datos multipart y urlencoded sin alterar las longitudes ni el framing de red.
+
+## [Planificado para Mañana] Fase 8.3: Format-Preserving Tokenization y De-tokenización Bidireccional (Bóveda RAM)
+
+### Objetivo
+- Permitir que el usuario envíe listas de datos privados estructurados (como DNIs, nombres propios o tarjetas de crédito) a modelos de IA para ser ordenados o analizados, sin revelar la identidad real a los proveedores de nube (Google AI Studio, OpenAI, etc.), realizando una tokenización dinámica en vuelo (ida) y su posterior restauración de forma transparente (vuelta).
+
+### Plan de Acción
+- [ ] **Diseñar la Bóveda de Tokens en Memoria (Token Vault)**:
+  - Crear un almacén thread-safe `TokenVault` en `proxy/` basado en `sync.Map` con políticas de expiración (TTL) y aislamiento por contexto de request/sesión.
+  - Implementar generadores de tokens con preservación de formato (ej: generar un DNI sintético válido pero ficticio como `99999999X` para el DNI real `12345678A`, o nombres realistas como `John Doe` para `Alice Smith`).
+- [ ] **Desarrollar el Interceptor Bidireccional**:
+  - **Intercepción de Ida (Request)**: Si la petición está marcada para tokenización, escanear el cuerpo en streaming, reemplazar los datos reales con los tokens y registrar el mapeo `Token -> RealValue` en la Bóveda.
+  - **Intercepción de Vuelta (Response)**: Al recibir el flujo de respuesta del LLM (incluso en streaming), escanear el contenido en busca de tokens activos de la sesión, restaurar el texto a sus valores reales originales y enviarlo al navegador.
+- [ ] **Escribir Casos de Prueba**:
+  - Crear `TestRequestResponseTokenizationE2E` validando que la IA ordena una lista de nombres tokenizados y el navegador recibe el resultado perfectamente ordenado con los nombres reales.
