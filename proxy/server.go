@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -65,6 +66,8 @@ type Server struct {
 	schedules    atomic.Value
 	upstreamPool atomic.Value
 	mitmBypass   atomic.Value
+	greySSLSites atomic.Value
+	greySSLIps   atomic.Value
 	now          func() time.Time
 	rateLimiter  *ipRateLimiter
 	h2Transport  *http2.Transport
@@ -126,11 +129,9 @@ func NewServer(addr string, logger *slog.Logger, certs ...CertificateProvider) *
 			if dialer == nil {
 				return nil, fmt.Errorf("no upstream dialer configured")
 			}
-			dialAddr := addr
-			if s.dnsResolver != nil {
-				if resolved, err := s.dnsResolver.ResolveAddr(ctx, addr); err == nil {
-					dialAddr = resolved
-				}
+			dialAddr, err := s.resolveDialAddress(ctx, addr)
+			if err != nil {
+				return nil, err
 			}
 			if s.breakers == nil {
 				return dialer.Dial(ctx, dialAddr, host)
@@ -214,7 +215,31 @@ func (s *Server) SetMITMBypass(hosts []string) {
 	s.mitmBypass.Store(m)
 }
 
+func (s *Server) SetGreySSLRules(sites *DomainMatcher, ips *IPMatcher) {
+	s.greySSLSites.Store(sites)
+	s.greySSLIps.Store(ips)
+}
+
 func (s *Server) shouldBypassMITM(host string) bool {
+	if val := s.greySSLSites.Load(); val != nil {
+		if sites, ok := val.(*DomainMatcher); ok && sites.Match(host) {
+			return false
+		}
+	}
+	if val := s.greySSLIps.Load(); val != nil {
+		if ips, ok := val.(*IPMatcher); ok {
+			hostStr := host
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				hostStr = h
+			}
+			if addr, err := netip.ParseAddr(hostStr); err == nil {
+				if ips.Match(addr) {
+					return false
+				}
+			}
+		}
+	}
+
 	val := s.mitmBypass.Load()
 	if val == nil {
 		return false
@@ -743,6 +768,9 @@ func (s *Server) handlePlainHTTP(w http.ResponseWriter, r *http.Request, profile
 		writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this destination by domain policy.")
 		return
 	}
+	if dec.BypassFilters {
+		r = r.WithContext(context.WithValue(r.Context(), BypassFiltersCtxKey{}, true))
+	}
 	permit, ok, reason := s.acquireConnForProfile(r.Context(), profile)
 	if !ok {
 		ConnectionsRejected.WithLabelValues(reason).Inc()
@@ -753,6 +781,15 @@ func (s *Server) handlePlainHTTP(w http.ResponseWriter, r *http.Request, profile
 
 	lease, err := s.acquirePlainHTTP(r.Context(), address, host, opts.IOTimeout)
 	if err != nil {
+		if decision, ok := policyDecisionFromError(err); ok {
+			RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+			logExchangeBlocked(s.logger, r, decision, opts)
+			if isWS {
+				WebSocketSessions.WithLabelValues("denied").Inc()
+			}
+			writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this destination by IP policy.")
+			return
+		}
 		if s.logger != nil {
 			s.logger.Error("dial http upstream", slog.String("address", address), slog.String("host", host), slog.Any("error", err))
 		}
@@ -841,7 +878,7 @@ func (s *Server) handlePlainHTTP(w http.ResponseWriter, r *http.Request, profile
 	}
 
 	_, reqSpan := GlobalTracer.Start(r.Context(), "Request Processing")
-	reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, r, reqCap, opts.RequestFilter)
+	reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, r, reqCap, opts, s.logger)
 	if err != nil {
 		reqSpan.RecordError(err)
 		reqSpan.SetStatus(codes.Error, err.Error())
@@ -863,7 +900,11 @@ func (s *Server) handlePlainHTTP(w http.ResponseWriter, r *http.Request, profile
 		if !opts.DumpOnPolicyHit || reqDec.Blocked {
 			safeReqDump("blocked")
 		}
-		writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this request by content policy.")
+		detail := "LucidGate blocked this request by content policy."
+		if reqDec.MatchType == "exfiltration preventer" {
+			detail = "LucidGate blocked this request to prevent sensitive data exfiltration."
+		}
+		writeBlockPage(w, http.StatusForbidden, "Access denied", detail)
 		return
 	}
 
@@ -955,11 +996,9 @@ func (s *Server) dialPlainHTTP(ctx context.Context, address string, timeout time
 	if err != nil {
 		host = address
 	}
-	dialAddr := address
-	if s.dnsResolver != nil {
-		if resolved, err := s.dnsResolver.ResolveAddr(ctx, address); err == nil {
-			dialAddr = resolved
-		}
+	dialAddr, err := s.resolveDialAddress(ctx, address)
+	if err != nil {
+		return nil, err
 	}
 	if s.breakers == nil {
 		return dialer.DialContext(ctx, "tcp", dialAddr)
@@ -995,6 +1034,40 @@ func (s *Server) policyBlocked(host string, req *http.Request, scheme string) Po
 func (s *Server) policyResponseBlocked(resp *http.Response, scheme string) PolicyDecision {
 	policy := s.policy.Load().(*Policy)
 	return policy.EvaluateResponse(resp, scheme)
+}
+
+func (s *Server) resolveDialAddress(ctx context.Context, address string) (string, error) {
+	policy, _ := s.policy.Load().(*Policy)
+	forceResolve := policy != nil && policy.RequiresResolvedSiteIP()
+
+	dialAddr := address
+	resolvedHost := addressHost(address)
+	if s.dnsResolver != nil {
+		resolved, host, err := s.dnsResolver.ResolveAddrForPolicy(ctx, address, forceResolve)
+		if err != nil {
+			if forceResolve {
+				return "", err
+			}
+		} else {
+			dialAddr = resolved
+			resolvedHost = host
+		}
+	}
+
+	if policy != nil {
+		if decision := policy.EvaluateResolvedDestinationIP(resolvedHost); decision.Blocked {
+			return "", &policyBlockError{decision: decision}
+		}
+	}
+	return dialAddr, nil
+}
+
+func addressHost(address string) string {
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		return host
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(address, "]"), "[")
 }
 
 func (s *Server) clientProfile(remoteAddr string) (string, bool) {
@@ -1163,6 +1236,14 @@ func (s *Server) handleBypassMITM(w http.ResponseWriter, r *http.Request, host s
 	address := connectAddress(r)
 	upstreamConn, err := s.dialPlainHTTP(r.Context(), address, 10*time.Second)
 	if err != nil {
+		if decision, ok := policyDecisionFromError(err); ok {
+			RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+			opts := s.relay.Load().(RelayOptions)
+			logExchangeBlocked(s.logger, r, decision, opts)
+			_, _ = bufrw.WriteString("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+			_ = bufrw.Flush()
+			return
+		}
 		if s.logger != nil {
 			s.logger.Error("bypass dial upstream", slog.String("address", address), slog.String("host", host), slog.Any("error", err))
 		}
@@ -1269,19 +1350,18 @@ func (s *Server) acquireHTTPSUpstream(ctx context.Context, address, host string)
 		cctx, dialSpan := GlobalTracer.Start(cctx, "Exchange Upstream Dial")
 		defer dialSpan.End()
 
-		dialAddr := address
+		dialAddr, err := s.resolveDialAddress(cctx, address)
+		if err != nil {
+			dialSpan.RecordError(err)
+			dialSpan.SetStatus(codes.Error, err.Error())
+			return nil, err
+		}
 		if s.dnsResolver != nil {
 			_, dnsSpan := GlobalTracer.Start(cctx, "DNS Lookup")
-			if resolved, err := s.dnsResolver.ResolveAddr(cctx, address); err == nil {
-				dialAddr = resolved
-				dnsSpan.SetAttributes(
-					attribute.String("net.peer.name", address),
-					attribute.String("net.peer.ip", resolved),
-				)
-			} else {
-				dnsSpan.RecordError(err)
-				dnsSpan.SetStatus(codes.Error, err.Error())
-			}
+			dnsSpan.SetAttributes(
+				attribute.String("net.peer.name", address),
+				attribute.String("net.peer.ip", dialAddr),
+			)
 			dnsSpan.End()
 		}
 
@@ -1291,20 +1371,20 @@ func (s *Server) acquireHTTPSUpstream(ctx context.Context, address, host string)
 		)
 
 		var conn net.Conn
-		var err error
+		var dialErr error
 		if s.breakers == nil {
-			conn, err = dialer.Dial(cctx, dialAddr, host)
+			conn, dialErr = dialer.Dial(cctx, dialAddr, host)
 		} else {
-			conn, err = s.breakers.Execute(host, func() (net.Conn, error) {
+			conn, dialErr = s.breakers.Execute(host, func() (net.Conn, error) {
 				return dialer.Dial(cctx, dialAddr, host)
 			})
 		}
 
-		if err != nil {
-			dialSpan.RecordError(err)
-			dialSpan.SetStatus(codes.Error, err.Error())
+		if dialErr != nil {
+			dialSpan.RecordError(dialErr)
+			dialSpan.SetStatus(codes.Error, dialErr.Error())
 		}
-		return conn, err
+		return conn, dialErr
 	})
 	if err != nil {
 		return nil, err
@@ -1520,6 +1600,13 @@ func (s *Server) handleHTTPSStream(w http.ResponseWriter, r *http.Request, conne
 			s.handleHTTPSStreamH2Upstream(w, upReq, host, xid, opts)
 			return
 		}
+		if decision, ok := policyDecisionFromError(err); ok {
+			closeRequestBody(upReq)
+			RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+			logExchangeBlocked(s.logger, upReq, decision, opts)
+			writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this destination by IP policy.")
+			return
+		}
 		closeRequestBody(upReq)
 		if s.logger != nil {
 			s.logger.Error("dial h2 downstream upstream", slog.String("address", address), slog.String("host", host), slog.Any("error", err))
@@ -1557,7 +1644,7 @@ func (s *Server) handleHTTPSStream(w http.ResponseWriter, r *http.Request, conne
 	}
 
 	_, reqSpan := GlobalTracer.Start(r.Context(), "Request Processing")
-	reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, upReq, reqCap, opts.RequestFilter)
+	reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, upReq, reqCap, opts, s.logger)
 	if err != nil {
 		reqSpan.RecordError(err)
 		reqSpan.SetStatus(codes.Error, err.Error())
@@ -1579,7 +1666,11 @@ func (s *Server) handleHTTPSStream(w http.ResponseWriter, r *http.Request, conne
 		if !opts.DumpOnPolicyHit || reqDec.Blocked {
 			safeReqDump("blocked")
 		}
-		writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this request by content policy.")
+		detail := "LucidGate blocked this request by content policy."
+		if reqDec.MatchType == "exfiltration preventer" {
+			detail = "LucidGate blocked this request to prevent sensitive data exfiltration."
+		}
+		writeBlockPage(w, http.StatusForbidden, "Access denied", detail)
 		return
 	}
 
@@ -1660,9 +1751,69 @@ func (s *Server) handleHTTPSStream(w http.ResponseWriter, r *http.Request, conne
 }
 
 func (s *Server) handleHTTPSStreamH2Upstream(w http.ResponseWriter, req *http.Request, host, xid string, opts RelayOptions) {
+	if req.Body != nil {
+		body := io.Reader(req.Body)
+		var inspect *InspectReader
+		var reqSubInspect *InspectReader
+		origBody := req.Body
+
+		if shouldInspectRequest(req) {
+			inspect = newInspectReader(origBody, reqFilter(opts.RequestFilter))
+			body = inspect
+		}
+
+		if opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
+			if shouldSubstituteRequest(req) {
+				if req.ProtoAtLeast(1, 1) {
+					subEngine := opts.RequestSubstitutionFilter.NewFilter()
+					if shouldBlockOnMatch(req) {
+						if subStreamFilter, ok := subEngine.(*multiSubstitutionStreamFilter); ok {
+							subStreamFilter.BlockOnMatch = true
+						}
+					}
+					reqSubInspect = newInspectReader(body, subEngine)
+					body = reqSubInspect
+				}
+			}
+		}
+
+		if inspect != nil || reqSubInspect != nil {
+			req.Body = readCloser{
+				Reader: body,
+				close: func() error {
+					var firstErr error
+					if reqSubInspect != nil {
+						if err := reqSubInspect.Close(); err != nil && firstErr == nil {
+							firstErr = err
+						}
+					}
+					if inspect != nil {
+						if err := inspect.Close(); err != nil && firstErr == nil {
+							firstErr = err
+						}
+					}
+					if err := origBody.Close(); err != nil && firstErr == nil {
+						firstErr = err
+					}
+					return firstErr
+				},
+			}
+		}
+	}
+
 	resp, err := s.roundTripH2(req, host)
 	closeRequestBody(req)
 	if err != nil {
+		if decision, ok := policyDecisionFromError(err); ok {
+			RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+			logExchangeBlocked(s.logger, req, decision, opts)
+			detail := "LucidGate blocked this destination by IP policy."
+			if decision.MatchType == "exfiltration preventer" {
+				detail = "LucidGate blocked this request to prevent sensitive data exfiltration."
+			}
+			writeBlockPage(w, http.StatusForbidden, "Access denied", detail)
+			return
+		}
 		if s.logger != nil {
 			s.logger.Error("h2 downstream h2 upstream roundtrip", slog.String("host", host), slog.Any("error", err))
 		}

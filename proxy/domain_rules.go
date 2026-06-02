@@ -8,10 +8,16 @@ import (
 )
 
 type DomainRules struct {
-	blocked    domainTrie
-	exceptions domainTrie
-	blockRegex []*regexp.Regexp
-	allowRegex []*regexp.Regexp
+	localExceptions  domainTrie
+	localGrey        domainTrie
+	localBlocked     domainTrie
+	exceptions       domainTrie
+	grey             domainTrie
+	blocked          domainTrie
+	blockRegex       []*regexp.Regexp
+	allowRegex       []*regexp.Regexp
+	allowedTLDs      map[string]bool
+	blanketBlockTLDs map[string]bool
 }
 
 type flatNode struct {
@@ -49,24 +55,46 @@ type RegexRule struct {
 }
 
 type DomainRulesConfig struct {
-	Blocked    []string
-	Exceptions []string
-	BlockRegex []RegexRule
-	AllowRegex []RegexRule
+	LocalExceptions  []string
+	LocalGrey        []string
+	LocalBlocked     []string
+	Exceptions       []string
+	Grey             []string
+	Blocked          []string
+	BlockRegex       []RegexRule
+	AllowRegex       []RegexRule
+	AllowedTLDs      []string
+	BlanketBlockTLDs []string
 }
 
 func NewDomainRulesConfig(cfg DomainRulesConfig) (*DomainRules, error) {
 	rules := &DomainRules{}
-	for _, domain := range cfg.Blocked {
-		rules.blocked.Add(domain)
+	for _, domain := range cfg.LocalExceptions {
+		rules.localExceptions.Add(domain)
+	}
+	for _, domain := range cfg.LocalGrey {
+		rules.localGrey.Add(domain)
+	}
+	for _, domain := range cfg.LocalBlocked {
+		rules.localBlocked.Add(domain)
 	}
 	for _, domain := range cfg.Exceptions {
 		rules.exceptions.Add(domain)
 	}
+	for _, domain := range cfg.Grey {
+		rules.grey.Add(domain)
+	}
+	for _, domain := range cfg.Blocked {
+		rules.blocked.Add(domain)
+	}
 
 	// Compilar los Tries al finalizar la fase de parsing
-	rules.blocked.Compile()
+	rules.localExceptions.Compile()
+	rules.localGrey.Compile()
+	rules.localBlocked.Compile()
 	rules.exceptions.Compile()
+	rules.grey.Compile()
+	rules.blocked.Compile()
 
 	for _, rule := range cfg.BlockRegex {
 		compiled, err := compilePolicyRegex(rule)
@@ -82,19 +110,33 @@ func NewDomainRulesConfig(cfg DomainRulesConfig) (*DomainRules, error) {
 		}
 		rules.allowRegex = append(rules.allowRegex, compiled)
 	}
-	return rules, nil
-}
 
-func (r *DomainRules) Add(domain string) {
-	r.blocked.Add(domain)
+	if len(cfg.AllowedTLDs) > 0 {
+		rules.allowedTLDs = make(map[string]bool)
+		for _, tld := range cfg.AllowedTLDs {
+			rules.allowedTLDs[strings.TrimSpace(strings.ToLower(tld))] = true
+		}
+	}
+	if len(cfg.BlanketBlockTLDs) > 0 {
+		rules.blanketBlockTLDs = make(map[string]bool)
+		for _, tld := range cfg.BlanketBlockTLDs {
+			rules.blanketBlockTLDs[strings.TrimSpace(strings.ToLower(tld))] = true
+		}
+	}
+
+	return rules, nil
 }
 
 func (r *DomainRules) Compile() {
 	if r == nil {
 		return
 	}
-	r.blocked.Compile()
+	r.localExceptions.Compile()
+	r.localGrey.Compile()
+	r.localBlocked.Compile()
 	r.exceptions.Compile()
+	r.grey.Compile()
+	r.blocked.Compile()
 }
 
 func (t *domainTrie) Add(domain string) {
@@ -191,14 +233,58 @@ func (r *DomainRules) Decision(host string) PolicyDecision {
 	if host == "" {
 		return PolicyDecision{}
 	}
+
+	// 1. local exception
+	if r.localExceptions.Match(host) {
+		return PolicyDecision{BypassFilters: true, MatchType: "domain_local_exception", Value: host}
+	}
+
+	// 2. local grey
+	if r.localGrey.Match(host) {
+		return PolicyDecision{BypassFilters: false, MatchType: "domain_local_grey", Value: host}
+	}
+
+	// 3. local banned
+	if r.localBlocked.Match(host) {
+		return PolicyDecision{Blocked: true, MatchType: "domain_local", Value: host}
+	}
+
+	// 4. main exception
 	if r.exceptions.Match(host) {
-		return PolicyDecision{}
+		return PolicyDecision{BypassFilters: true, MatchType: "domain_exception", Value: host}
 	}
 	for _, rx := range r.allowRegex {
 		if rx.MatchString(host) {
-			return PolicyDecision{}
+			return PolicyDecision{BypassFilters: true, MatchType: "domain_exception_regex", Value: rx.String()}
 		}
 	}
+
+	// 5. main grey
+	if r.grey.Match(host) {
+		return PolicyDecision{BypassFilters: false, MatchType: "domain_grey", Value: host}
+	}
+
+	// 5.5 TLD Blanket check
+	if len(r.allowedTLDs) > 0 || len(r.blanketBlockTLDs) > 0 {
+		if !isIPAddress(host) {
+			lastDot := strings.LastIndexByte(host, '.')
+			var tld string
+			if lastDot == -1 {
+				tld = host
+			} else {
+				tld = host[lastDot+1:]
+			}
+			
+			if len(r.allowedTLDs) > 0 && !r.allowedTLDs[tld] {
+				return PolicyDecision{Blocked: true, MatchType: "tld_blanket", Value: host}
+			}
+			if len(r.blanketBlockTLDs) > 0 && r.blanketBlockTLDs[tld] {
+				return PolicyDecision{Blocked: true, MatchType: "tld_blanket", Value: host}
+			}
+		}
+	}
+
+	// 6. main banned
 	if r.blocked.Match(host) {
 		return PolicyDecision{Blocked: true, MatchType: "domain", Value: host}
 	}
@@ -207,6 +293,7 @@ func (r *DomainRules) Decision(host string) PolicyDecision {
 			return PolicyDecision{Blocked: true, MatchType: "domain_regex", Value: rx.String()}
 		}
 	}
+
 	return PolicyDecision{}
 }
 
@@ -317,4 +404,23 @@ func normalizedDomain(host string) string {
 		return ""
 	}
 	return host
+}
+
+func isIPAddress(host string) bool {
+	if strings.Contains(host, ":") {
+		return true
+	}
+	dots := 0
+	digits := 0
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if c >= '0' && c <= '9' {
+			digits++
+		} else if c == '.' {
+			dots++
+		} else {
+			return false
+		}
+	}
+	return dots == 3 && digits > 0
 }

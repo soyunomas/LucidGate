@@ -32,7 +32,14 @@ func NewDNSResolver(enabled bool, ttl time.Duration) *DNSResolver {
 }
 
 func (r *DNSResolver) Resolve(ctx context.Context, host string) (string, error) {
-	if !r.enabled || r.ttl <= 0 {
+	return r.resolve(ctx, host, false)
+}
+
+func (r *DNSResolver) resolve(ctx context.Context, host string, force bool) (string, error) {
+	if r == nil {
+		return host, nil
+	}
+	if (!r.enabled || r.ttl <= 0) && !force {
 		return host, nil
 	}
 
@@ -42,10 +49,12 @@ func (r *DNSResolver) Resolve(ctx context.Context, host string) (string, error) 
 	}
 
 	now := time.Now()
-	if val, ok := r.cache.Load(host); ok {
-		entry := val.(*dnsEntry)
-		if now.Before(entry.expiresAt) {
-			return entry.ips[0].String(), nil
+	if r.enabled && r.ttl > 0 {
+		if val, ok := r.cache.Load(host); ok {
+			entry := val.(*dnsEntry)
+			if now.Before(entry.expiresAt) {
+				return entry.ips[0].String(), nil
+			}
 		}
 	}
 
@@ -57,23 +66,33 @@ func (r *DNSResolver) Resolve(ctx context.Context, host string) (string, error) 
 		return "", &net.DNSError{Err: "no IP addresses found", Name: host}
 	}
 
-	r.cache.Store(host, &dnsEntry{
-		ips:       ips,
-		expiresAt: now.Add(r.ttl),
-	})
+	if r.enabled && r.ttl > 0 {
+		r.cache.Store(host, &dnsEntry{
+			ips:       ips,
+			expiresAt: now.Add(r.ttl),
+		})
+	}
 
 	return ips[0].String(), nil
 }
 
 func (r *DNSResolver) ResolveAddr(ctx context.Context, address string) (string, error) {
+	resolvedAddr, _, err := r.ResolveAddrForPolicy(ctx, address, false)
+	return resolvedAddr, err
+}
+
+func (r *DNSResolver) ResolveAddrForPolicy(ctx context.Context, address string, force bool) (resolvedAddr string, resolvedHost string, err error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		// Just a hostname
-		return r.Resolve(ctx, address)
+		resolvedHost, err = r.resolve(ctx, address, force)
+		if err != nil {
+			return "", "", err
+		}
+		return resolvedHost, resolvedHost, nil
 	}
-	resolvedHost, err := r.Resolve(ctx, host)
+	resolvedHost, err = r.resolve(ctx, host, force)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return net.JoinHostPort(resolvedHost, port), nil
+	return net.JoinHostPort(resolvedHost, port), resolvedHost, nil
 }

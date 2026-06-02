@@ -57,4 +57,20 @@ var (
 		Name: "lucidgate_websocket_bytes_total",
 		Help: "Total bytes transferred over WebSocket sessions.",
 	}, []string{"direction"}) // "in" (client->upstream), "out" (upstream->client)
+	RequestSubstitutionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "lucidgate_request_substitutions_total",
+		Help: "Total request body substitutions performed by LucidGate.",
+	}, []string{"kind"}) // "literal", "regex"
+	RequestSubstitutionSkippedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "lucidgate_request_substitution_skipped_total",
+		Help: "Total requests skipped for body substitution.",
+	}, []string{"reason"}) // "framing", etc.
+	AlertsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "lucidgate_alerts_total",
+		Help: "Total policy alerts triggered by LucidGate.",
+	}, []string{"category"})
+	DroppedLogsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "lucidgate_dropped_logs_total",
+		Help: "Total exchange logs dropped due to full queue.",
+	}, []string{"sink"}) // "access", "alert"
 )

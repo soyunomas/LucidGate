@@ -238,6 +238,114 @@ func TestServeHTTPPlainHTTPBlocksDeniedDomainBeforeDial(t *testing.T) {
 	}
 }
 
+func TestServeHTTPPlainHTTPBlocksResolvedSiteIPBeforeDial(t *testing.T) {
+	server := NewServer("127.0.0.1:0", nil)
+	policy, err := NewPolicy(PolicyConfig{
+		SiteIPs: SiteIPRulesConfig{Blocked: []string{"203.0.113.0/24"}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	server.SetPolicy(policy)
+	resolver := &mockLookupResolver{ips: []net.IP{net.ParseIP("203.0.113.7")}}
+	server.dnsResolver = NewDNSResolver(false, 0)
+	server.dnsResolver.resolver = resolver
+
+	var dialed atomic.Bool
+	server.SetPlainHTTPDialer(plainDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		dialed.Store(true)
+		return nil, errors.New("dial should not happen")
+	}))
+	req := httptest.NewRequest(http.MethodGet, "http://resolved-blocked.test/path", nil)
+	req.RemoteAddr = "127.0.0.1:50000"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	assertBlockPage(t, rec, "Access denied")
+	if dialed.Load() {
+		t.Fatal("plain HTTP dialer was called after resolved site IP block")
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("DNS lookups = %d, want 1", resolver.calls)
+	}
+}
+
+func TestServeHTTPPlainHTTPDialsResolvedAddressOnceForSiteIPPolicy(t *testing.T) {
+	server := NewServer("127.0.0.1:0", nil)
+	policy, err := NewPolicy(PolicyConfig{
+		SiteIPs: SiteIPRulesConfig{Blocked: []string{"198.51.100.0/24"}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	server.SetPolicy(policy)
+	resolver := &mockLookupResolver{ips: []net.IP{net.ParseIP("203.0.113.8")}}
+	server.dnsResolver = NewDNSResolver(false, 0)
+	server.dnsResolver.resolver = resolver
+
+	server.SetPlainHTTPDialer(plainDialerFunc(func(_ context.Context, network, address string) (net.Conn, error) {
+		if network != "tcp" || address != "203.0.113.8:80" {
+			return nil, fmt.Errorf("dial target = %s/%s, want tcp/203.0.113.8:80", network, address)
+		}
+		proxySide, upstreamSide := net.Pipe()
+		go func() {
+			defer upstreamSide.Close()
+			if _, err := http.ReadRequest(bufio.NewReader(upstreamSide)); err != nil {
+				return
+			}
+			_, _ = io.WriteString(upstreamSide, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+		}()
+		return proxySide, nil
+	}))
+	req := httptest.NewRequest(http.MethodGet, "http://resolved-allowed.test/path", nil)
+	req.RemoteAddr = "127.0.0.1:50000"
+	rec := httptest.NewRecorder()
+
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d body=%q", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("DNS lookups = %d, want 1", resolver.calls)
+	}
+}
+
+func TestAcquireHTTPSUpstreamBlocksResolvedSiteIPBeforeDial(t *testing.T) {
+	server := NewServer("127.0.0.1:0", nil)
+	policy, err := NewPolicy(PolicyConfig{
+		SiteIPs: SiteIPRulesConfig{Blocked: []string{"203.0.113.0/24"}},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	server.SetPolicy(policy)
+	resolver := &mockLookupResolver{ips: []net.IP{net.ParseIP("203.0.113.9")}}
+	server.dnsResolver = NewDNSResolver(false, 0)
+	server.dnsResolver.resolver = resolver
+
+	var dialed atomic.Bool
+	server.SetUpstreamDialer(upstreamDialerFunc(func(context.Context, string, string) (net.Conn, error) {
+		dialed.Store(true)
+		return nil, errors.New("dial should not happen")
+	}))
+
+	_, err = server.acquireHTTPSUpstream(context.Background(), "resolved-blocked.test:443", "resolved-blocked.test")
+	if _, ok := policyDecisionFromError(err); !ok {
+		t.Fatalf("acquireHTTPSUpstream() error = %v, want policy block", err)
+	}
+	if dialed.Load() {
+		t.Fatal("HTTPS upstream dialer was called after resolved site IP block")
+	}
+	if resolver.calls != 1 {
+		t.Fatalf("DNS lookups = %d, want 1", resolver.calls)
+	}
+}
+
 func TestServeHTTPPlainHTTPBlocksDeniedURLBeforeDial(t *testing.T) {
 	server := NewServer("127.0.0.1:0", nil)
 	policy, err := NewPolicy(PolicyConfig{
@@ -1417,7 +1525,7 @@ func TestWriteRequestStreamingDoesNotBufferAboveLimit(t *testing.T) {
 	req.ContentLength = 5
 	var out bytes.Buffer
 	cap := newBodyCapture(req.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 4, DumpDir: t.TempDir()})
-	got, _, err := writeRequestStreaming(&out, req, cap, nil)
+	got, _, err := writeRequestStreaming(&out, req, cap, RelayOptions{}, nil)
 	if err != nil {
 		t.Fatalf("writeRequestStreaming() error = %v", err)
 	}
@@ -1444,7 +1552,7 @@ func TestWriteRequestStreamingStopsTextUploadOnSemanticMatch(t *testing.T) {
 	var out bytes.Buffer
 	cap := newBodyCapture(req.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 4})
 
-	got, _, err := writeRequestStreaming(&out, req, cap, filter)
+	got, _, err := writeRequestStreaming(&out, req, cap, RelayOptions{RequestFilter: filter}, nil)
 	if err != nil {
 		t.Fatalf("writeRequestStreaming() error = %v", err)
 	}
@@ -1468,7 +1576,7 @@ func TestWriteRequestStreamingBypassesMultipartUpload(t *testing.T) {
 	var out bytes.Buffer
 	cap := newBodyCapture(req.Body != nil, RelayOptions{LogBodies: true, MaxCaptureBytes: 4})
 
-	got, _, err := writeRequestStreaming(&out, req, cap, filter)
+	got, _, err := writeRequestStreaming(&out, req, cap, RelayOptions{RequestFilter: filter}, nil)
 	if err != nil {
 		t.Fatalf("writeRequestStreaming() error = %v", err)
 	}
@@ -1922,6 +2030,97 @@ func TestSetRelayOptionsPublishesLatestSemanticFilter(t *testing.T) {
 	}
 	if strings.Contains(blockedOut.String(), "after") {
 		t.Fatalf("latest filter did not block new phrase: %q", blockedOut.String())
+	}
+}
+
+func TestPlainHTTPRefererExceptionBypassesResponseFilters(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = io.WriteString(w, "before blocked phrase after")
+	}))
+	defer upstream.Close()
+
+	freeLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen proxy: %v", err)
+	}
+	proxyAddr := freeLn.Addr().String()
+	freeLn.Close()
+
+	policy, err := NewPolicy(PolicyConfig{
+		Referer: RefererRulesConfig{
+			ExceptionSites: []string{"trusted-ref.test"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	filter, err := NewPhraseFilter([]string{"blocked phrase"})
+	if err != nil {
+		t.Fatalf("NewPhraseFilter() error = %v", err)
+	}
+	server := NewServer(proxyAddr, nil)
+	server.SetPolicy(policy)
+	server.SetRelayOptions(RelayOptions{
+		Policy:          policy,
+		Filter:          filter,
+		IOTimeout:       time.Second,
+		LogBodies:       true,
+		MaxCaptureBytes: 1024,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	defer func() {
+		cancel()
+		if err := <-errCh; err != nil && err != context.Canceled {
+			t.Fatalf("Serve() finished with error: %v", err)
+		}
+	}()
+
+	proxyURL, err := url.Parse("http://" + proxyAddr)
+	if err != nil {
+		t.Fatalf("parse proxy URL: %v", err)
+	}
+	client := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		Timeout:   5 * time.Second,
+	}
+
+	resp, err := client.Get(upstream.URL)
+	if err != nil {
+		t.Fatalf("GET without referer: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read response without referer: %v", err)
+	}
+	if strings.Contains(string(body), " after") {
+		t.Fatalf("response without referer was not filtered: %q", string(body))
+	}
+
+	req, err := http.NewRequest(http.MethodGet, upstream.URL, nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Referer", "https://trusted-ref.test/source")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("GET with referer: %v", err)
+	}
+	body, err = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read response with referer: %v", err)
+	}
+	if string(body) != "before blocked phrase after" {
+		t.Fatalf("response with referer = %q, want unfiltered body", string(body))
 	}
 }
 

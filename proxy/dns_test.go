@@ -156,6 +156,23 @@ func TestDNSResolverDisabled(t *testing.T) {
 	}
 }
 
+func TestDNSResolverResolveAddrForPolicyCanForceLookup(t *testing.T) {
+	mock := &mockLookupResolver{ips: []net.IP{net.ParseIP("203.0.113.10")}}
+	r := NewDNSResolver(false, 0)
+	r.resolver = mock
+
+	resolvedAddr, resolvedHost, err := r.ResolveAddrForPolicy(context.Background(), "policy.example:443", true)
+	if err != nil {
+		t.Fatalf("ResolveAddrForPolicy() error = %v", err)
+	}
+	if resolvedAddr != "203.0.113.10:443" || resolvedHost != "203.0.113.10" {
+		t.Fatalf("resolved = %q host=%q, want 203.0.113.10:443 host 203.0.113.10", resolvedAddr, resolvedHost)
+	}
+	if mock.calls != 1 {
+		t.Fatalf("DNS lookups = %d, want 1", mock.calls)
+	}
+}
+
 func TestDNSResolverError(t *testing.T) {
 	mock := &mockLookupResolver{err: errors.New("dns lookup timeout")}
 	r := NewDNSResolver(true, 10*time.Second)

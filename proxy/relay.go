@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -31,6 +32,8 @@ import (
 	"github.com/klauspost/compress/gzip"
 	"github.com/klauspost/compress/zstd"
 )
+
+type BypassFiltersCtxKey struct{}
 
 // BodyBytesNotCaptured is returned in log fields when the body length is
 // unknown or capture was deliberately skipped.
@@ -100,11 +103,15 @@ type RelayOptions struct {
 	WSIdleTimeout            time.Duration
 	Filter                   FilterEngine
 	RequestFilter            FilterEngine
+	RequestSubstitutionFilter *SubstitutionFilter
 	Policy                   *Policy
 	RoundTripH2              func(*http.Request) (*http.Response, error)
 	H2Hosts                  *sync.Map
 	HTTP3Enabled             bool
 	HTTP3Port                string
+	AccessLogger             *slog.Logger
+	AlertLogger              *slog.Logger
+	AlertCategories          map[string]bool
 }
 
 type FilterEngine interface {
@@ -249,17 +256,46 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 		if !isWS {
 			SanitizeHeaders(req)
 		}
+		if opts.Policy != nil {
+			opts.Policy.RewriteRequestHeaders(req.Header)
+			rawURL := canonicalPolicyURL(req, "https")
+			opts.Policy.AddRequestHeaders(req.Header, rawURL)
+		}
 		normalizeRequestURL(req)
+		if opts.Policy != nil && opts.Policy.urls != nil {
+			rawURL := canonicalPolicyURL(req, "https")
+			if rewrittenURL, modified := opts.Policy.urls.RewriteURL(rawURL); modified {
+				if parsed, err := url.Parse(rewrittenURL); err == nil {
+					req.URL = parsed
+					req.Host = parsed.Host
+				}
+			}
+		}
+		if opts.Policy != nil && opts.Policy.urls != nil {
+			rawURL := canonicalPolicyURL(req, "https")
+			if dec, redirected := opts.Policy.urls.RedirectDecision(rawURL); redirected {
+				closeRequestBody(req)
+				RuleHits.WithLabelValues("default", dec.MatchType, "redirect").Inc()
+				logExchangeBlocked(logger, req, dec, opts)
+				if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+					return fmt.Errorf("deadline local redirect write: %w", err)
+				}
+				_, _ = io.WriteString(localConn, redirectResponse(dec.RedirectURL))
+				return nil
+			}
+		}
 		req.Close = false
 		host := req.Host
 		if req.URL != nil && req.URL.Hostname() != "" {
 			host = req.URL.Hostname()
 		}
+		var reqDec PolicyDecision
 		if opts.Policy != nil {
-			if decision := opts.Policy.EvaluateRequest(host, req, "https"); decision.Blocked {
+			reqDec = opts.Policy.EvaluateRequest(host, req, "https")
+			if reqDec.Blocked {
 				closeRequestBody(req)
-				RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
-				logExchangeBlocked(logger, req, decision, opts)
+				RuleHits.WithLabelValues("default", reqDec.MatchType, "block").Inc()
+				logExchangeBlocked(logger, req, reqDec, opts)
 				if isWS {
 					WebSocketSessions.WithLabelValues("denied").Inc()
 				}
@@ -269,6 +305,9 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 				_, _ = io.WriteString(localConn, policyBlockResponse())
 				return nil
 			}
+			if reqDec.BypassFilters {
+				req = req.WithContext(context.WithValue(req.Context(), BypassFiltersCtxKey{}, true))
+			}
 		}
 
 		if isWS {
@@ -276,6 +315,17 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 				if acquire != nil {
 					lease, aerr := acquire()
 					if aerr != nil {
+						if decision, ok := policyDecisionFromError(aerr); ok {
+							RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+							logExchangeBlocked(logger, req, decision, opts)
+							WebSocketSessions.WithLabelValues("denied").Inc()
+							closeRequestBody(req)
+							if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+								return fmt.Errorf("deadline local policy block write: %w", err)
+							}
+							_, _ = io.WriteString(localConn, policyBlockResponse())
+							return nil
+						}
 						if errors.Is(aerr, errNegotiatedH2) {
 							WebSocketSessions.WithLabelValues("error").Inc()
 							closeRequestBody(req)
@@ -337,6 +387,16 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 			if acquire != nil {
 				lease, err := acquire()
 				if err != nil {
+					if decision, ok := policyDecisionFromError(err); ok {
+						RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
+						logExchangeBlocked(logger, req, decision, opts)
+						closeRequestBody(req)
+						if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+							return fmt.Errorf("deadline local policy block write: %w", err)
+						}
+						_, _ = io.WriteString(localConn, policyBlockResponse())
+						return nil
+					}
 					if errors.Is(err, errNegotiatedH2) {
 						if doH2RoundTrip != nil {
 							if err := doH2RoundTrip(req, host); err != nil {
@@ -399,7 +459,7 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 			}
 		}
 
-		reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, req, reqCap, exchangeOpts.RequestFilter)
+		reqBytes, reqDec, err := writeRequestStreaming(upstreamWriter, req, reqCap, exchangeOpts, logger)
 		if err != nil {
 			closeRequestBody(req)
 			if !exchangeOpts.DumpOnPolicyHit || reqDec.Blocked {
@@ -433,6 +493,9 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 				safeReqDump("allowed")
 			}
 			return fmt.Errorf("read upstream response: %w", err)
+		}
+		if exchangeOpts.Policy != nil {
+			exchangeOpts.Policy.RewriteResponseHeaders(resp.Header)
 		}
 		if stripHTTP3Advertising(resp.Header) {
 			AltSvcStripped.Inc()
@@ -837,7 +900,7 @@ func (c *bodyCapture) dumpPayload() ([]byte, bool, string) {
 	return c.tee.buf.Bytes(), c.tee.full, ""
 }
 
-func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, filter FilterEngine) (int64, PolicyDecision, error) {
+func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, opts RelayOptions, logger *slog.Logger) (int64, PolicyDecision, error) {
 	var dec PolicyDecision
 	if req.Body == nil {
 		if err := req.Write(w); err != nil {
@@ -849,17 +912,47 @@ func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, fil
 	var inspect *InspectReader
 	var activeFilter FilterEngine
 	if shouldInspectRequest(req) {
-		activeFilter = reqFilter(filter)
+		activeFilter = reqFilter(opts.RequestFilter)
 		inspect = newInspectReader(req.Body, activeFilter)
 		defer inspect.Close()
 		body = inspect
 	}
+
+	var reqSubInspect *InspectReader
+	if opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
+		if shouldSubstituteRequest(req) {
+			if !req.ProtoAtLeast(1, 1) {
+				RequestSubstitutionSkippedTotal.WithLabelValues("framing").Inc()
+				if logger != nil {
+					logger.Warn("Request body substitution skipped due to unsupported framing", slog.String("proto", req.Proto))
+				}
+			} else {
+				subEngine := opts.RequestSubstitutionFilter.NewFilter()
+				if shouldBlockOnMatch(req) {
+					if subStreamFilter, ok := subEngine.(*multiSubstitutionStreamFilter); ok {
+						subStreamFilter.BlockOnMatch = true
+					}
+				}
+				reqSubInspect = newInspectReader(body, subEngine)
+				defer reqSubInspect.Close()
+				body = reqSubInspect
+			}
+		}
+	}
+
 	if err := writeRequestHeader(w, req); err != nil {
 		return 0, dec, err
 	}
 	n, err := writeBodyStreaming(w, body, requestUsesChunked(req), req.ContentLength, req.Trailer, cap)
 
-	if err != nil && errors.Is(err, ErrAntivirusBlocked) {
+	if err != nil && errors.Is(err, ErrSecretExfiltrationBlocked) {
+		dec = PolicyDecision{
+			Blocked:   true,
+			MatchType: "exfiltration preventer",
+			Value:     "sensitive data exfiltration blocked",
+		}
+		err = nil
+	} else if err != nil && errors.Is(err, ErrAntivirusBlocked) {
 		val := "antivirus signature"
 		errMsg := err.Error()
 		prefix := "antivirus blocked response: "
@@ -897,6 +990,47 @@ func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, fil
 	return cap.logBytes(n), dec, err
 }
 
+func shouldSubstituteRequest(req *http.Request) bool {
+	if req == nil || req.Body == nil {
+		return false
+	}
+	switch req.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+	default:
+		return false
+	}
+	ce := normalizeContentEncoding(req.Header.Get("Content-Encoding"))
+	if ce != "" && ce != "identity" {
+		return false
+	}
+	ct := req.Header.Get("Content-Type")
+	if isMutableRequestContentType(ct) {
+		return true
+	}
+	mt := strings.ToLower(strings.TrimSpace(strings.SplitN(ct, ";", 2)[0]))
+	if mt == "multipart/form-data" {
+		return true
+	}
+	return false
+}
+
+func shouldBlockOnMatch(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	host := strings.ToLower(req.Host)
+	if strings.Contains(host, "aistudio.google") ||
+		strings.Contains(host, "googleapis.com") ||
+		strings.Contains(host, "clients6.google.com") {
+		return true
+	}
+	ct := strings.ToLower(req.Header.Get("Content-Type"))
+	if strings.Contains(ct, "protobuf") || strings.Contains(ct, "grpc") {
+		return true
+	}
+	return false
+}
+
 func reqFilter(engine FilterEngine) FilterEngine {
 	if content, ok := engine.(*ContentFilter); ok {
 		if content.Semantic != nil {
@@ -924,8 +1058,19 @@ func writeResponseStreaming(w io.Writer, resp *http.Response, cap *bodyCapture, 
 	body := io.Reader(resp.Body)
 	originalContentLength := resp.ContentLength
 	var transformed io.ReadCloser
-	inspectResponse := shouldInspectResponse(resp, filter)
-	antivirus := antivirusForResponse(resp, filter)
+	
+	var bypassFilters bool
+	if resp.Request != nil {
+		if b, ok := resp.Request.Context().Value(BypassFiltersCtxKey{}).(bool); ok && b {
+			bypassFilters = true
+		}
+	}
+
+	inspectResponse := shouldInspectResponse(resp, filter) && !bypassFilters
+	var antivirus *Antivirus
+	if !bypassFilters {
+		antivirus = antivirusForResponse(resp, filter)
+	}
 	var activeFilter FilterEngine
 	if inspectResponse {
 		inspected, active, err := newResponseInspectReader(resp.Body, resp.Header.Get("Content-Encoding"), respFilter(filter, resp.Header.Get("Content-Type"), resp.Request))
@@ -1006,8 +1151,19 @@ func writeResponseStreamingHTTP(w http.ResponseWriter, resp *http.Response, cap 
 	}
 	body := io.Reader(resp.Body)
 	var transformed io.ReadCloser
-	inspectResponse := shouldInspectResponse(resp, filter)
-	antivirus := antivirusForResponse(resp, filter)
+
+	var bypassFilters bool
+	if resp.Request != nil {
+		if b, ok := resp.Request.Context().Value(BypassFiltersCtxKey{}).(bool); ok && b {
+			bypassFilters = true
+		}
+	}
+
+	inspectResponse := shouldInspectResponse(resp, filter) && !bypassFilters
+	var antivirus *Antivirus
+	if !bypassFilters {
+		antivirus = antivirusForResponse(resp, filter)
+	}
 	forceChunked := inspectResponse || antivirus != nil
 	var activeFilter FilterEngine
 	if inspectResponse {
@@ -1713,9 +1869,17 @@ func copyBufferPooledSize(dst io.Writer, src io.Reader, sizeHint int64) (int64, 
 }
 
 func logExchange(logger *slog.Logger, req *http.Request, resp *http.Response, reqBytes int64, respBytes int64, opts RelayOptions) {
-	if logger == nil || req == nil {
+	if req == nil {
 		return
 	}
+	targetLogger := logger
+	if opts.AccessLogger != nil {
+		targetLogger = opts.AccessLogger
+	}
+	if targetLogger == nil {
+		return
+	}
+
 	path := ""
 	if req.URL != nil {
 		path = req.URL.RequestURI()
@@ -1781,13 +1945,28 @@ func logExchange(logger *slog.Logger, req *http.Request, resp *http.Response, re
 		RuleHits.WithLabelValues("default", listName, "log").Inc()
 	}
 
-	logger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+	targetLogger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+
+	if policyLog && listName != "" && len(opts.AlertCategories) > 0 && opts.AlertCategories[listName] {
+		AlertsTotal.WithLabelValues(listName).Inc()
+		if opts.AlertLogger != nil {
+			opts.AlertLogger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+		}
+	}
 }
 
 func logExchangeBlocked(logger *slog.Logger, req *http.Request, decision PolicyDecision, opts RelayOptions) {
-	if logger == nil || req == nil {
+	if req == nil {
 		return
 	}
+	targetLogger := logger
+	if opts.AccessLogger != nil {
+		targetLogger = opts.AccessLogger
+	}
+	if targetLogger == nil {
+		return
+	}
+
 	path := ""
 	if req.URL != nil {
 		path = req.URL.RequestURI()
@@ -1796,7 +1975,7 @@ func logExchangeBlocked(logger *slog.Logger, req *http.Request, decision PolicyD
 		path = "/"
 	}
 
-	logger.LogAttrs(context.Background(), slog.LevelInfo, "exchange",
+	attrs := []slog.Attr{
 		slog.String("method", req.Method),
 		slog.String("host", req.Host),
 		slog.String("path", path),
@@ -1805,7 +1984,16 @@ func logExchangeBlocked(logger *slog.Logger, req *http.Request, decision PolicyD
 		slog.String("policy_match_type", decision.MatchType),
 		slog.String("policy_value", decision.Value),
 		slog.String("profile", "default"),
-	)
+	}
+
+	targetLogger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+
+	if decision.MatchType != "" && len(opts.AlertCategories) > 0 && opts.AlertCategories[decision.MatchType] {
+		AlertsTotal.WithLabelValues(decision.MatchType).Inc()
+		if opts.AlertLogger != nil {
+			opts.AlertLogger.LogAttrs(context.Background(), slog.LevelInfo, "exchange", attrs...)
+		}
+	}
 }
 
 // ---------- Cleartext dumping (Phase 1: Blue-Team capture) ----------
@@ -2489,4 +2677,8 @@ func isHostH2(h2Hosts *sync.Map, host string) bool {
 		return false
 	}
 	return val.(bool)
+}
+
+func redirectResponse(targetURL string) string {
+	return fmt.Sprintf("HTTP/1.1 302 Found\r\nLocation: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", targetURL)
 }
