@@ -38,16 +38,18 @@
 # -----------------------------------------------------------------------------
 # MITM: certificate prewarm and TLS interception bypasses.
 # -----------------------------------------------------------------------------
-# [mitm]
+[mitm]
 # prewarm_hosts = [                         # Hostnames to pre-generate leaf certs for at startup/reload.
 #   "www.google.com",
 #   "github.com",
 #   "chatgpt.com",
 # ]
-# bypass_hosts = [                          # Hostnames that should bypass MITM inspection.
-#   "updates.example.test",
-#   "banking.example.test",
-# ]
+bypass_hosts = [                            # Hostnames that should bypass MITM inspection.
+  # Claude's edge bootstrap returns 500 under TLS/HTTP re-emission; keep the
+  # rest of Anthropic domains inspectable unless they show the same failure.
+  "claude.ai",
+  "*.claude.ai",
+]
 
 # -----------------------------------------------------------------------------
 # Logging and forensic payload dumps.
@@ -77,9 +79,9 @@
 # -----------------------------------------------------------------------------
 # e2guardian-style list loading.
 # -----------------------------------------------------------------------------
-# [rules]
-# include_dir = [                           # Directories or files to load. Directories are read alphabetically.
-#   "lists/sites",
+[rules]
+include_dir = [                             # Directories or files to load. Directories are read alphabetically.
+  "lists/sites",
 #   "lists/downloads",
 #   "lists/http",
 #   "lists/phraselists",
@@ -87,7 +89,7 @@
 #   "lists/clients",
 #   "lists/groups",
 #   "lists/time",
-# ]
+]
 
 # Supported list filenames under include_dir:
 # sites: bannedsitelist, exceptionsitelist, localexceptionsitelist, localgreysitelist,
@@ -199,8 +201,8 @@
 # -----------------------------------------------------------------------------
 # Response/body substitution.
 # -----------------------------------------------------------------------------
-# [substitution]
-# rule_lists = ["lists/substitution/substitutionlist"]
+[substitution]
+rule_lists = ["lists/substitution/substitutionlist"]
 # regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
 
 # [[substitution.rule]]
@@ -216,8 +218,8 @@
 # Request/body substitution. Use narrow DLP rules; broad request mutation can
 # break CSRF tokens, signed payloads and JSON/protobuf APIs.
 # -----------------------------------------------------------------------------
-# [request_substitution]
-# rule_lists = ["lists/substitution/requestsubstitutionlist"]
+[request_substitution]
+rule_lists = ["lists/substitution/requestsubstitutionlist"]
 # regex_rule_lists = ["lists/substitution/requestregexsubstitutionlist"]
 
 # [[request_substitution.rule]]
@@ -228,6 +230,22 @@
 # pattern = "(?i)(api[_-]?key=)[A-Za-z0-9._-]+"
 # replace = "${1}[redacted]"
 # max_window_bytes = 65536
+
+# -----------------------------------------------------------------------------
+# Target-aware audit scope: focus inspection on declared roots and dependencies.
+# -----------------------------------------------------------------------------
+[audit_scope]
+enabled = true
+mode = "target_aware"
+roots = []
+root_domain_lists = ["lists/audit/targetdomainslist"]
+dependency_ttl = "30m"
+max_dependencies = 8192
+none_mode = "tunnel"                  # tunnel | noinspect
+dependency_mutations = "restricted"   # none | restricted | full
+discover_html = true
+discover_css = true
+discover_js = true
 
 # -----------------------------------------------------------------------------
 # OpenTelemetry tracing.

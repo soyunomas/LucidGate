@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -20,53 +22,53 @@ import (
 const version = "0.1.0"
 
 type appConfig struct {
-	ConfigPath                   string
-	ListenAddr                   string
-	CertDir                      string
-	MaxConnections               int
-	IOTimeout                    time.Duration
-	WSIdleTimeout                time.Duration
-	DialTimeout                  time.Duration
-	UpstreamMaxIdlePerHost       int
-	UpstreamIdleTimeout          time.Duration
-	HandshakeTimeout             time.Duration
-	WaitTimeout                  time.Duration
-	CertWorkers                  int
-	MITMPrewarmHosts             []string
-	LogBodies                    bool
-	LogBodiesSampleRate          float64
-	MaxCaptureBytes              int64
-	UpstreamInsecure             bool
-	DumpDir                      string
-	DumpOnPolicyHit              bool
-	DumpCredentialsCleartext     bool
-	AuditKey                     string
-	DumpMaxSizeMB                int
-	DumpMaxBackups               int
-	DumpMinFreeSpaceMB           int64
-	DumpCompress                 bool
-	MITMBypassHosts              []string
-	IncludeDirs                  []string
-	AccessProfiles               []AccessProfileConfig
-	ScheduleWindows              []ScheduleWindowConfig
-	SemanticPhrases              []string
-	SemanticWeighted             []SemanticPhraseConfig
-	SemanticThreshold            int
-	SemanticBlockedPhraseLists   []string
-	SemanticWeightedPhraseLists  []string
-	SemanticExceptionPhraseLists []string
-	SemanticExceptionPhrases     []string
-	SemanticWeightedExceptions   []SemanticPhraseConfig
-	MaskingPhrases               []string
-	MaskingPhraseLists           []string
-	HTMLBanner                   string
-	MagicBlockedTypes            []string
-	AntivirusEnabled             bool
-	AntivirusClamAV              string
-	AntivirusTempDir             string
-	AntivirusTrickle             time.Duration
-	AntivirusTimeout             time.Duration
-	ShowVersion                  bool
+	ConfigPath                        string
+	ListenAddr                        string
+	CertDir                           string
+	MaxConnections                    int
+	IOTimeout                         time.Duration
+	WSIdleTimeout                     time.Duration
+	DialTimeout                       time.Duration
+	UpstreamMaxIdlePerHost            int
+	UpstreamIdleTimeout               time.Duration
+	HandshakeTimeout                  time.Duration
+	WaitTimeout                       time.Duration
+	CertWorkers                       int
+	MITMPrewarmHosts                  []string
+	LogBodies                         bool
+	LogBodiesSampleRate               float64
+	MaxCaptureBytes                   int64
+	UpstreamInsecure                  bool
+	DumpDir                           string
+	DumpOnPolicyHit                   bool
+	DumpCredentialsCleartext          bool
+	AuditKey                          string
+	DumpMaxSizeMB                     int
+	DumpMaxBackups                    int
+	DumpMinFreeSpaceMB                int64
+	DumpCompress                      bool
+	MITMBypassHosts                   []string
+	IncludeDirs                       []string
+	AccessProfiles                    []AccessProfileConfig
+	ScheduleWindows                   []ScheduleWindowConfig
+	SemanticPhrases                   []string
+	SemanticWeighted                  []SemanticPhraseConfig
+	SemanticThreshold                 int
+	SemanticBlockedPhraseLists        []string
+	SemanticWeightedPhraseLists       []string
+	SemanticExceptionPhraseLists      []string
+	SemanticExceptionPhrases          []string
+	SemanticWeightedExceptions        []SemanticPhraseConfig
+	MaskingPhrases                    []string
+	MaskingPhraseLists                []string
+	HTMLBanner                        string
+	MagicBlockedTypes                 []string
+	AntivirusEnabled                  bool
+	AntivirusClamAV                   string
+	AntivirusTempDir                  string
+	AntivirusTrickle                  time.Duration
+	AntivirusTimeout                  time.Duration
+	ShowVersion                       bool
 	Substitutions                     []SubstitutionConfig
 	SubstitutionRuleLists             []string
 	RegexSubstitutions                []RegexSubstitutionConfig
@@ -83,29 +85,39 @@ type appConfig struct {
 	GreySSLSiteIPs                    []string
 	GreySSLSitesMatcher               *proxy.DomainMatcher
 	GreySSLSiteIPsMatcher             *proxy.IPMatcher
-	BannedClients                []string
-	AccessLog                    string
-	AlertLog                     string
-	AlertCategories              []string
-	ExceptionClients             []string
-	FilterGroups                 []string
-	IPGroupMappings              []IPGroupMapping
-	LogPhrases                   []string
-	ExceptionLogPhrases          []string
-	MetricsEnabled               bool
-	MetricsListenAddr            string
-	ReusePort                    bool
-	CircuitBreakerEnabled        bool
-	CircuitBreakerFailures       int
-	CircuitBreakerTimeout        time.Duration
-	DNSCacheEnabled              bool
-	DNSCacheTTL                  time.Duration
-	HTTP3Enabled                 bool
-	TracingEnabled               bool
-	TracingEndpoint              string
-	TracingInsecure              bool
-	TracingServiceName           string
-	TracingSampleRate            float64
+	BannedClients                     []string
+	AccessLog                         string
+	AlertLog                          string
+	AlertCategories                   []string
+	ExceptionClients                  []string
+	FilterGroups                      []string
+	IPGroupMappings                   []IPGroupMapping
+	LogPhrases                        []string
+	ExceptionLogPhrases               []string
+	MetricsEnabled                    bool
+	MetricsListenAddr                 string
+	ReusePort                         bool
+	CircuitBreakerEnabled             bool
+	CircuitBreakerFailures            int
+	CircuitBreakerTimeout             time.Duration
+	DNSCacheEnabled                   bool
+	DNSCacheTTL                       time.Duration
+	HTTP3Enabled                      bool
+	TracingEnabled                    bool
+	TracingEndpoint                   string
+	TracingInsecure                   bool
+	TracingServiceName                string
+	TracingSampleRate                 float64
+	AuditScopeEnabled                 bool
+	AuditScopeRoots                   []string
+	AuditScopeRootDomainLists         []string
+	AuditScopeDependencyTTL           time.Duration
+	AuditScopeMaxDependencies         int
+	AuditScopeNoneMode                string
+	AuditScopeDependencyMutations     string
+	AuditScopeDiscoverHTML            bool
+	AuditScopeDiscoverCSS             bool
+	AuditScopeDiscoverJS              bool
 }
 
 type SubstitutionConfig struct {
@@ -149,42 +161,49 @@ type SemanticPhraseConfig struct {
 
 func parseConfig(args []string, getenv func(string) string, output io.Writer) (appConfig, error) {
 	cfg := appConfig{
-		ConfigPath:             envString(getenv, "CONFIG", ""),
-		ListenAddr:             "127.0.0.1:8080",
-		CertDir:                "certs",
-		MaxConnections:         1024,
-		IOTimeout:              30 * time.Second,
-		WSIdleTimeout:          5 * time.Minute,
-		DialTimeout:            10 * time.Second,
-		UpstreamMaxIdlePerHost: 32,
-		UpstreamIdleTimeout:    90 * time.Second,
-		HandshakeTimeout:       5 * time.Second,
-		WaitTimeout:            250 * time.Millisecond,
-		CertWorkers:            runtime.NumCPU(),
-		LogBodies:              true,
-		LogBodiesSampleRate:    1.0,
-		MaxCaptureBytes:        1 << 20,
-		DumpOnPolicyHit:        false,
-		DumpMaxSizeMB:          100,
-		DumpMaxBackups:         10,
-		DumpMinFreeSpaceMB:     1024,
-		DumpCompress:           true,
-		AntivirusTrickle:       time.Second,
-		AntivirusTimeout:       30 * time.Second,
-		MetricsEnabled:         false,
-		MetricsListenAddr:      "127.0.0.1:6060",
-		ReusePort:              false,
-		CircuitBreakerEnabled:  true,
-		CircuitBreakerFailures: 5,
-		CircuitBreakerTimeout:  30 * time.Second,
-		DNSCacheEnabled:        true,
-		DNSCacheTTL:            60 * time.Second,
-		HTTP3Enabled:           false,
-		TracingEnabled:         false,
-		TracingEndpoint:        "localhost:4317",
-		TracingInsecure:        true,
-		TracingServiceName:     "lucidgate",
-		TracingSampleRate:      1.0,
+		ConfigPath:                    envString(getenv, "CONFIG", ""),
+		ListenAddr:                    "127.0.0.1:8080",
+		CertDir:                       "certs",
+		MaxConnections:                1024,
+		IOTimeout:                     30 * time.Second,
+		WSIdleTimeout:                 5 * time.Minute,
+		DialTimeout:                   10 * time.Second,
+		UpstreamMaxIdlePerHost:        32,
+		UpstreamIdleTimeout:           90 * time.Second,
+		HandshakeTimeout:              5 * time.Second,
+		WaitTimeout:                   250 * time.Millisecond,
+		CertWorkers:                   runtime.NumCPU(),
+		LogBodies:                     true,
+		LogBodiesSampleRate:           1.0,
+		MaxCaptureBytes:               1 << 20,
+		DumpOnPolicyHit:               false,
+		DumpMaxSizeMB:                 100,
+		DumpMaxBackups:                10,
+		DumpMinFreeSpaceMB:            1024,
+		DumpCompress:                  true,
+		AntivirusTrickle:              time.Second,
+		AntivirusTimeout:              30 * time.Second,
+		MetricsEnabled:                false,
+		MetricsListenAddr:             "127.0.0.1:6060",
+		ReusePort:                     false,
+		CircuitBreakerEnabled:         true,
+		CircuitBreakerFailures:        5,
+		CircuitBreakerTimeout:         30 * time.Second,
+		DNSCacheEnabled:               true,
+		DNSCacheTTL:                   60 * time.Second,
+		HTTP3Enabled:                  false,
+		TracingEnabled:                false,
+		TracingEndpoint:               "localhost:4317",
+		TracingInsecure:               true,
+		TracingServiceName:            "lucidgate",
+		TracingSampleRate:             1.0,
+		AuditScopeDependencyTTL:       30 * time.Minute,
+		AuditScopeMaxDependencies:     8192,
+		AuditScopeNoneMode:            proxy.AuditNoneModeTunnel,
+		AuditScopeDependencyMutations: proxy.AuditDependencyMutationsRestricted,
+		AuditScopeDiscoverHTML:        true,
+		AuditScopeDiscoverCSS:         true,
+		AuditScopeDiscoverJS:          true,
 	}
 	if path := configPathFromArgs(args); path != "" {
 		cfg.ConfigPath = path
@@ -379,6 +398,19 @@ type tomlConfig struct {
 		ServiceName *string  `toml:"service_name"`
 		SampleRate  *float64 `toml:"sample_rate"`
 	} `toml:"tracing"`
+	AuditScope struct {
+		Enabled             *bool    `toml:"enabled"`
+		Mode                string   `toml:"mode"`
+		Roots               []string `toml:"roots"`
+		RootDomainLists     []string `toml:"root_domain_lists"`
+		DependencyTTL       string   `toml:"dependency_ttl"`
+		MaxDependencies     *int     `toml:"max_dependencies"`
+		NoneMode            string   `toml:"none_mode"`
+		DependencyMutations string   `toml:"dependency_mutations"`
+		DiscoverHTML        *bool    `toml:"discover_html"`
+		DiscoverCSS         *bool    `toml:"discover_css"`
+		DiscoverJS          *bool    `toml:"discover_js"`
+	} `toml:"audit_scope"`
 }
 
 func loadTOMLConfig(path string, cfg *appConfig) error {
@@ -682,6 +714,40 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 	if raw.Tracing.SampleRate != nil {
 		cfg.TracingSampleRate = *raw.Tracing.SampleRate
 	}
+	if raw.AuditScope.Enabled != nil {
+		cfg.AuditScopeEnabled = *raw.AuditScope.Enabled
+	}
+	if len(raw.AuditScope.Roots) > 0 {
+		cfg.AuditScopeRoots = normalizeHostList(raw.AuditScope.Roots)
+	}
+	if len(raw.AuditScope.RootDomainLists) > 0 {
+		cfg.AuditScopeRootDomainLists = append(cfg.AuditScopeRootDomainLists[:0], raw.AuditScope.RootDomainLists...)
+	}
+	if raw.AuditScope.DependencyTTL != "" {
+		d, err := time.ParseDuration(raw.AuditScope.DependencyTTL)
+		if err != nil {
+			return fmt.Errorf("audit_scope.dependency_ttl: %w", err)
+		}
+		cfg.AuditScopeDependencyTTL = d
+	}
+	if raw.AuditScope.MaxDependencies != nil {
+		cfg.AuditScopeMaxDependencies = *raw.AuditScope.MaxDependencies
+	}
+	if raw.AuditScope.NoneMode != "" {
+		cfg.AuditScopeNoneMode = strings.ToLower(strings.TrimSpace(raw.AuditScope.NoneMode))
+	}
+	if raw.AuditScope.DependencyMutations != "" {
+		cfg.AuditScopeDependencyMutations = strings.ToLower(strings.TrimSpace(raw.AuditScope.DependencyMutations))
+	}
+	if raw.AuditScope.DiscoverHTML != nil {
+		cfg.AuditScopeDiscoverHTML = *raw.AuditScope.DiscoverHTML
+	}
+	if raw.AuditScope.DiscoverCSS != nil {
+		cfg.AuditScopeDiscoverCSS = *raw.AuditScope.DiscoverCSS
+	}
+	if raw.AuditScope.DiscoverJS != nil {
+		cfg.AuditScopeDiscoverJS = *raw.AuditScope.DiscoverJS
+	}
 
 	configDir := filepath.Dir(path)
 	if extra, err := loadTextListFiles(configDir, cfg.SemanticBlockedPhraseLists); err != nil {
@@ -744,6 +810,11 @@ func loadTOMLConfig(path string, cfg *appConfig) error {
 		}
 		cfg.RegexRequestSubstitutions = merged
 	}
+	if extra, err := loadTextListFiles(configDir, cfg.AuditScopeRootDomainLists); err != nil {
+		return err
+	} else {
+		cfg.AuditScopeRoots = appendUniqueStrings(cfg.AuditScopeRoots, normalizeHostList(extra))
+	}
 	return nil
 }
 
@@ -791,6 +862,14 @@ func applyEnv(cfg *appConfig, getenv func(string) string) {
 	cfg.TracingInsecure = envBool(getenv, "TRACING_INSECURE", cfg.TracingInsecure)
 	cfg.TracingServiceName = envString(getenv, "TRACING_SERVICE_NAME", cfg.TracingServiceName)
 	cfg.TracingSampleRate = envFloat(getenv, "TRACING_SAMPLE_RATE", cfg.TracingSampleRate)
+	cfg.AuditScopeEnabled = envBool(getenv, "AUDIT_SCOPE_ENABLED", cfg.AuditScopeEnabled)
+	if raw := envString(getenv, "AUDIT_SCOPE_ROOTS", ""); raw != "" {
+		cfg.AuditScopeRoots = normalizeHostList(splitNonEmpty(raw, ","))
+	}
+	cfg.AuditScopeDependencyTTL = envDuration(getenv, "AUDIT_SCOPE_DEPENDENCY_TTL", cfg.AuditScopeDependencyTTL)
+	cfg.AuditScopeMaxDependencies = envInt(getenv, "AUDIT_SCOPE_MAX_DEPENDENCIES", cfg.AuditScopeMaxDependencies)
+	cfg.AuditScopeNoneMode = envString(getenv, "AUDIT_SCOPE_NONE_MODE", cfg.AuditScopeNoneMode)
+	cfg.AuditScopeDependencyMutations = envString(getenv, "AUDIT_SCOPE_DEPENDENCY_MUTATIONS", cfg.AuditScopeDependencyMutations)
 	cfg.AntivirusEnabled = envBool(getenv, "ANTIVIRUS_ENABLED", cfg.AntivirusEnabled)
 	cfg.AntivirusClamAV = envString(getenv, "ANTIVIRUS_CLAMAV_ADDR", cfg.AntivirusClamAV)
 	cfg.AntivirusTempDir = envString(getenv, "ANTIVIRUS_TEMP_DIR", cfg.AntivirusTempDir)
@@ -873,6 +952,27 @@ func (c appConfig) validate() error {
 	if len(c.SemanticWeighted) > 0 && c.SemanticThreshold <= 0 {
 		return fmt.Errorf("semantic score threshold must be positive when weighted phrases are configured")
 	}
+	if c.AuditScopeEnabled {
+		if len(c.AuditScopeRoots) == 0 {
+			return fmt.Errorf("audit scope requires at least one root domain when enabled")
+		}
+		if c.AuditScopeDependencyTTL <= 0 {
+			return fmt.Errorf("audit scope dependency ttl must be positive")
+		}
+		if c.AuditScopeMaxDependencies <= 0 {
+			return fmt.Errorf("audit scope max dependencies must be positive")
+		}
+		switch c.AuditScopeNoneMode {
+		case proxy.AuditNoneModeTunnel, proxy.AuditNoneModeNoInspect:
+		default:
+			return fmt.Errorf("audit scope none_mode must be tunnel or noinspect")
+		}
+		switch c.AuditScopeDependencyMutations {
+		case proxy.AuditDependencyMutationsNone, proxy.AuditDependencyMutationsRestricted, proxy.AuditDependencyMutationsFull:
+		default:
+			return fmt.Errorf("audit scope dependency_mutations must be none, restricted, or full")
+		}
+	}
 	for _, profile := range c.AccessProfiles {
 		if profile.MaxConns != nil && *profile.MaxConns <= 0 {
 			return fmt.Errorf("access profile %q max_conns must be positive", profile.Name)
@@ -887,7 +987,136 @@ func (c appConfig) validate() error {
 			return fmt.Errorf("access profile %q: both rate_limit and rate_burst must be configured together", profile.Name)
 		}
 	}
+	if err := validateRequestRegexSubstitutionSafety(c.RegexRequestSubstitutions); err != nil {
+		return err
+	}
 	return nil
+}
+
+type requestRegexProtectedCanary struct {
+	name string
+	body string
+}
+
+var requestRegexProtectedCanaries = []requestRegexProtectedCanary{
+	{
+		name: "csrf token fields",
+		body: `{"csrf_token":"csrf-12345","request_token":"opaque-client-state","next":"/dashboard"}`,
+	},
+	{
+		name: "form csrf token fields",
+		body: `csrf_token=csrf-12345&request_token=opaque-client-state&next=%2Fdashboard`,
+	},
+	{
+		name: "signed jwt-like client state",
+		body: `id_token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature&next=%2Fdashboard`,
+	},
+	{
+		name: "numeric trace identifiers",
+		body: `{"trace_id":"1234567890123456","order_ref":"AB123456","session_code":"ES1200000000000000000000"}`,
+	},
+}
+
+type requestRegexStructuralCanary struct {
+	name  string
+	body  string
+	check func(string) bool
+}
+
+var requestRegexStructuralCanaries = []requestRegexStructuralCanary{
+	{
+		name: "json delimiters",
+		body: `{"password":"tiny","message":"keep-json-valid"}`,
+		check: func(out string) bool {
+			return json.Valid([]byte(out)) && strings.Contains(out, `"message"`)
+		},
+	},
+	{
+		name: "form delimiters",
+		body: `Password%3A+tiny%0A%0Aafter=must-remain`,
+		check: func(out string) bool {
+			return strings.Contains(out, "after=must-remain")
+		},
+	},
+}
+
+func validateRequestRegexSubstitutionSafety(rules []RegexSubstitutionConfig) error {
+	for _, rule := range rules {
+		if rule.Pattern == "" {
+			continue
+		}
+		if hasUnsafeGlobalCaseInsensitiveURLEncodedDelimiters(rule.Pattern) {
+			return formatRequestRegexSafetyError(rule, "unsafe request-body regex uses global (?i) with URL-encoded delimiters; scope case-insensitivity to field names")
+		}
+		re, err := regexp.Compile(rule.Pattern)
+		if err != nil {
+			if rule.Source != "" {
+				return fmt.Errorf("%s: compile request regex substitution %q: %w", rule.Source, rule.Pattern, err)
+			}
+			return fmt.Errorf("compile request regex substitution %q: %w", rule.Pattern, err)
+		}
+		for _, canary := range requestRegexProtectedCanaries {
+			if re.MatchString(canary.body) {
+				return formatRequestRegexSafetyError(rule, "unsafe request-body regex matches protected canary %q; use a more specific DLP pattern", canary.name)
+			}
+		}
+		for _, canary := range requestRegexStructuralCanaries {
+			out := applyLengthPreservedRegexReplacement(re, rule.Replace, canary.body)
+			if !canary.check(out) {
+				return formatRequestRegexSafetyError(rule, "unsafe request-body regex corrupts %s; preserve delimiters or narrow the match", canary.name)
+			}
+		}
+	}
+	return nil
+}
+
+func hasUnsafeGlobalCaseInsensitiveURLEncodedDelimiters(pattern string) bool {
+	if !strings.HasPrefix(pattern, "(?i)") {
+		return false
+	}
+	return strings.Contains(pattern, "%0[") ||
+		strings.Contains(pattern, "%2[") ||
+		strings.Contains(pattern, "%3A") ||
+		strings.Contains(pattern, "%3D")
+}
+
+func formatRequestRegexSafetyError(rule RegexSubstitutionConfig, format string, args ...any) error {
+	msg := fmt.Sprintf(format, args...)
+	if rule.Source != "" {
+		return fmt.Errorf("%s: %s", rule.Source, msg)
+	}
+	return fmt.Errorf("request regex substitution %q: %s", rule.Pattern, msg)
+}
+
+func applyLengthPreservedRegexReplacement(re *regexp.Regexp, replace, body string) string {
+	out := []byte(body)
+	repl := []byte(replace)
+	matches := re.FindAllSubmatchIndex(out, -1)
+	for i := len(matches) - 1; i >= 0; i-- {
+		loc := matches[i]
+		matchStart, matchEnd := loc[0], loc[1]
+		match := out[matchStart:matchEnd]
+		expanded := re.Expand(nil, repl, out, loc)
+		targetReplace := padOrTruncateBytes(expanded, len(match))
+		next := make([]byte, 0, len(out)-len(match)+len(targetReplace))
+		next = append(next, out[:matchStart]...)
+		next = append(next, targetReplace...)
+		next = append(next, out[matchEnd:]...)
+		out = next
+	}
+	return string(out)
+}
+
+func padOrTruncateBytes(replace []byte, targetLen int) []byte {
+	if len(replace) == targetLen {
+		return replace
+	}
+	out := make([]byte, targetLen)
+	copy(out, replace)
+	for i := len(replace); i < targetLen; i++ {
+		out[i] = '*'
+	}
+	return out
 }
 
 func envString(getenv func(string) string, key string, fallback string) string {
@@ -1007,6 +1236,7 @@ func normalizePrewarmHost(raw string) string {
 	host := strings.TrimSpace(raw)
 	host = strings.TrimPrefix(host, "http://")
 	host = strings.TrimPrefix(host, "https://")
+	host = strings.TrimPrefix(host, "*.")
 	if i := strings.IndexByte(host, '/'); i >= 0 {
 		host = host[:i]
 	}

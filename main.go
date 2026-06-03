@@ -245,6 +245,10 @@ func main() {
 }
 
 func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
+	if err := validateRequestRegexSubstitutionSafety(cfg.RegexRequestSubstitutions); err != nil {
+		return err
+	}
+
 	// loadRulePolicy mutates cfg with phrase lists discovered in
 	// [rules].include_dir (bannedphraselist, exceptionphraselist,
 	// weightedphraselist, weightedphraseexceptions). It must run before the
@@ -342,6 +346,17 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 			slog.Info("Request body substitution applied", slog.String("kind", kind), slog.String("pattern", pattern))
 		}
 	}
+	auditScope := proxy.NewAuditScope(proxy.AuditScopeConfig{
+		Enabled:             cfg.AuditScopeEnabled,
+		Roots:               cfg.AuditScopeRoots,
+		DependencyTTL:       cfg.AuditScopeDependencyTTL,
+		MaxDependencies:     cfg.AuditScopeMaxDependencies,
+		NoneMode:            cfg.AuditScopeNoneMode,
+		DependencyMutations: cfg.AuditScopeDependencyMutations,
+		DiscoverHTML:        cfg.AuditScopeDiscoverHTML,
+		DiscoverCSS:         cfg.AuditScopeDiscoverCSS,
+		DiscoverJS:          cfg.AuditScopeDiscoverJS,
+	})
 
 	cfg.NoCheckCertSitesMatcher = proxy.NewDomainMatcher(cfg.NoCheckCertSites)
 	noCheckIPsMatcher, err := proxy.NewIPMatcher(cfg.NoCheckCertSiteIPs)
@@ -390,26 +405,27 @@ func applyRuntimeConfig(server *proxy.Server, cfg *appConfig) error {
 	}
 
 	server.SetRelayOptions(proxy.RelayOptions{
-		LogBodies:                cfg.LogBodies,
-		LogBodiesSampleRate:      cfg.LogBodiesSampleRate,
-		MaxCaptureBytes:          cfg.MaxCaptureBytes,
-		DumpDir:                  cfg.DumpDir,
-		DumpOnPolicyHit:          cfg.DumpOnPolicyHit,
-		DumpCredentialsCleartext: cfg.DumpCredentialsCleartext,
-		AuditKey:                 cfg.AuditKey,
-		DumpMaxSizeMB:            cfg.DumpMaxSizeMB,
-		DumpMaxBackups:           cfg.DumpMaxBackups,
-		DumpMinFreeSpaceMB:       cfg.DumpMinFreeSpaceMB,
-		DumpCompress:             cfg.DumpCompress,
-		IOTimeout:                cfg.IOTimeout,
-		WSIdleTimeout:            cfg.WSIdleTimeout,
-		Filter:                   filter,
-		RequestFilter:            filter,
+		LogBodies:                 cfg.LogBodies,
+		LogBodiesSampleRate:       cfg.LogBodiesSampleRate,
+		MaxCaptureBytes:           cfg.MaxCaptureBytes,
+		DumpDir:                   cfg.DumpDir,
+		DumpOnPolicyHit:           cfg.DumpOnPolicyHit,
+		DumpCredentialsCleartext:  cfg.DumpCredentialsCleartext,
+		AuditKey:                  cfg.AuditKey,
+		DumpMaxSizeMB:             cfg.DumpMaxSizeMB,
+		DumpMaxBackups:            cfg.DumpMaxBackups,
+		DumpMinFreeSpaceMB:        cfg.DumpMinFreeSpaceMB,
+		DumpCompress:              cfg.DumpCompress,
+		IOTimeout:                 cfg.IOTimeout,
+		WSIdleTimeout:             cfg.WSIdleTimeout,
+		Filter:                    filter,
+		RequestFilter:             filter,
 		RequestSubstitutionFilter: reqSubstitution,
-		Policy:                   policy,
-		AccessLogger:             currentAccessLog,
-		AlertLogger:              currentAlertLog,
-		AlertCategories:          alertCats,
+		Policy:                    policy,
+		AuditScope:                auditScope,
+		AccessLogger:              currentAccessLog,
+		AlertLogger:               currentAlertLog,
+		AlertCategories:           alertCats,
 	})
 	server.SetPolicy(policy)
 	accessProfiles := make([]proxy.AccessProfile, 0, len(cfg.AccessProfiles))

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -181,6 +182,81 @@ foo([0-9]+) => bar$1
 		got[0].Pattern != `ca.*sa\.png` || got[0].Replace != "carcasa.png" || !strings.Contains(got[0].Source, "regex-subs.list:1") ||
 		got[1].Pattern != `foo([0-9]+)` || got[1].Replace != "bar$1" {
 		t.Fatalf("regex substitutions = %#v", got)
+	}
+}
+
+func TestBundledRequestRegexSubstitutionListIsCommentOnly(t *testing.T) {
+	got, err := loadRegexSubstitutionFiles(".", []string{"lists/substitution/requestregexsubstitutionlist"})
+	if err != nil {
+		t.Fatalf("loadRegexSubstitutionFiles() error = %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("bundled requestregexsubstitutionlist has active rules: %#v", got)
+	}
+}
+
+func TestBundledRequestRegexSubstitutionExamplesCompile(t *testing.T) {
+	data, err := os.ReadFile("lists/substitution/requestregexsubstitutionlist")
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	inExamples := false
+	for i, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.Contains(line, "Surgical commented examples:") {
+			inExamples = true
+			continue
+		}
+		if !inExamples || !strings.HasPrefix(line, "#") {
+			continue
+		}
+		candidate := strings.TrimSpace(strings.TrimPrefix(line, "#"))
+		if !strings.Contains(candidate, "=>") {
+			continue
+		}
+		pattern, _, err := parseSubstitutionLine(candidate)
+		if err != nil {
+			t.Fatalf("example line %d parse error = %v", i+1, err)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			t.Fatalf("example line %d regexp compile error = %v", i+1, err)
+		}
+	}
+}
+
+func TestParseConfigCombinesAuditScopeRootsAndDomainLists(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "lists", "audit", "targetdomainslist"), `# audit targets
+api.example.com
+*.assets.example.net
+.Include<extra-targets.list>
+`)
+	writeFile(t, filepath.Join(dir, "lists", "audit", "extra-targets.list"), `cdn.example.org
+example.com
+`)
+	tomlPath := filepath.Join(dir, "lucidgate.toml")
+	writeFile(t, tomlPath, `
+[audit_scope]
+enabled = true
+roots = ["example.com", "app.example.com"]
+root_domain_lists = ["lists/audit/targetdomainslist"]
+dependency_ttl = "5m"
+max_dependencies = 128
+none_mode = "noinspect"
+dependency_mutations = "none"
+`)
+
+	cfg, err := parseConfig([]string{"--config", tomlPath}, emptyEnv, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("parseConfig() error = %v", err)
+	}
+	want := []string{"example.com", "app.example.com", "api.example.com", "assets.example.net", "cdn.example.org"}
+	if strings.Join(cfg.AuditScopeRoots, ",") != strings.Join(want, ",") {
+		t.Fatalf("AuditScopeRoots = %#v, want %#v", cfg.AuditScopeRoots, want)
+	}
+	if !cfg.AuditScopeEnabled || cfg.AuditScopeDependencyTTL.String() != "5m0s" || cfg.AuditScopeMaxDependencies != 128 ||
+		cfg.AuditScopeNoneMode != "noinspect" || cfg.AuditScopeDependencyMutations != "none" {
+		t.Fatalf("audit scope config = %#v", cfg)
 	}
 }
 

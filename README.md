@@ -25,12 +25,14 @@ Use it only on systems and traffic you own or are explicitly authorized to inspe
 - Basic HTML visible-text tokenization for semantic filtering.
 - Text masking for non-HTML textual responses.
 - Phrase substitution for textual responses.
+- Literal and regex request-body substitution for mutable uploads, with safety validation for broad request regexes.
 - HTML banner injection before `</body>`.
 - Streaming textual upload inspection for `POST`, `PUT`, and `PATCH`.
 - Bypass for binary, multipart, request-compressed, and unsupported response-compressed payloads.
 - Optional bounded JSONL body dump for offline analysis.
 - External e2guardian-style phrase, masking, and substitution lists with `.Include<...>` recursion and per-file/line error reporting.
 - Per-host MITM bypass list (`mitm.bypass_hosts`) for HSTS-pinned/banking/mTLS sites, with `*.example.com` wildcards and zero-copy `splice(2)` tunneling.
+- Target-aware audit scope: classify traffic as `root`, `dependency`, or `none` from configured domains and propagate scope through `Referer`/`Origin`.
 - Optional HTTP/3 (QUIC) downstream listener via `quic-go/http3` with dynamic MITM leaf certificates.
 - Per-host upstream circuit breaker (`sony/gobreaker`), TTL-cached internal DNS resolver, `SO_REUSEPORT` multi-listener mode, and zero-downtime hot restart via `cloudflare/tableflip` (`SIGUSR2`).
 - Per-profile concurrency cap (`max_conns`) and per-client-IP token-bucket rate limiting (`rate_limit`/`rate_burst`).
@@ -119,6 +121,10 @@ insecure_skip_verify = false
 
 [mitm]
 prewarm_hosts = ["www.google.com", "www.gstatic.com"]
+bypass_hosts = [
+  "claude.ai",
+  "*.claude.ai",
+]
 
 [logging]
 log_bodies = true
@@ -173,6 +179,23 @@ rule_lists = ["lists/substitution/substitutionlist"]
 search = "internal codename"
 replace = "public project"
 
+[request_substitution]
+rule_lists = ["lists/substitution/requestsubstitutionlist"]
+regex_rule_lists = ["lists/substitution/requestregexsubstitutionlist"]
+
+[audit_scope]
+enabled = true
+mode = "target_aware"
+roots = []
+root_domain_lists = ["lists/audit/targetdomainslist"]
+dependency_ttl = "30m"
+max_dependencies = 8192
+none_mode = "tunnel"
+dependency_mutations = "restricted"
+discover_html = true
+discover_css = true
+discover_js = true
+
 [injection]
 html_banner = "<div style=\"position:fixed;left:0;right:0;bottom:0;z-index:2147483647;background:#111827;color:#fff;padding:8px 12px;font:14px sans-serif;text-align:center\">LucidGate inspected this page</div>"
 ```
@@ -222,6 +245,8 @@ html_banner = "<div style=\"position:fixed;left:0;right:0;bottom:0;z-index:21474
 | — | `LUCIDGATE_METRICS_LISTEN_ADDR` | `127.0.0.1:6060` | Admin server listen address (`/metrics`, `/debug/pprof`, `/livez`, `/readyz`). |
 | `--upstream-insecure-skip-verify` | `LUCIDGATE_UPSTREAM_INSECURE_SKIP_VERIFY` | `false` | Skip upstream TLS verification. Lab/smoke only. |
 | `--version` | none | `false` | Print version and exit. |
+
+Target-aware audit scope is configured primarily through `[audit_scope]` in TOML. The supported environment overrides are `LUCIDGATE_AUDIT_SCOPE_ENABLED`, `LUCIDGATE_AUDIT_SCOPE_ROOTS`, `LUCIDGATE_AUDIT_SCOPE_DEPENDENCY_TTL`, `LUCIDGATE_AUDIT_SCOPE_MAX_DEPENDENCIES`, `LUCIDGATE_AUDIT_SCOPE_NONE_MODE`, and `LUCIDGATE_AUDIT_SCOPE_DEPENDENCY_MUTATIONS`.
 
 The antivirus subsystem is configured exclusively via `[antivirus]` in TOML (`enabled`, `clamav_addr`, `temp_dir`, `trickle_interval`, `scan_timeout`) or matching `LUCIDGATE_ANTIVIRUS_*` environment variables. There are no command-line flags for antivirus.
 
@@ -279,6 +304,47 @@ bypass_hosts = [
 ```
 
 Bypassed hosts skip TLS termination and all content filters (semantic, masking, substitution, antivirus). Domain-level policy (`bannedsitelist`, access profiles, schedules) still applies because they are evaluated against the CONNECT target before bypass takes effect. Wildcards (`*.example.com`) match the apex domain and every subdomain.
+
+Current `lucidgate.toml` uses a minimal compatibility tunnel for:
+
+```toml
+[mitm]
+bypass_hosts = [
+  "claude.ai",
+  "*.claude.ai",
+]
+```
+
+This is intentionally narrow. Firefox traffic showed that Claude's `edge-api/bootstrap/.../app_start` endpoint returns `500` under TLS/HTTP re-emission even when filters and request substitutions are disabled. Keeping only `claude.ai` in the tunnel avoids breaking Claude while leaving Anthropic auxiliary hosts such as `api.anthropic.com`, `a-api.anthropic.com`, `assets-proxy.anthropic.com`, `a-cdn.anthropic.com`, and `s-cdn.anthropic.com` inspectable.
+
+### Target-Aware Audit Scope
+
+Target-aware audit scope narrows LucidGate's active inspection to explicitly declared roots and the dependencies reached from those roots. This is intended for blue-team audits of a specific web app without building fragile combinations of global allow, exception, log, nolog, and substitution lists.
+
+```toml
+[audit_scope]
+enabled = true
+mode = "target_aware"
+roots = ["example.com", "app.example.com"]
+root_domain_lists = ["lists/audit/targetdomainslist"]
+dependency_ttl = "30m"
+max_dependencies = 8192
+none_mode = "tunnel"                  # tunnel | noinspect
+dependency_mutations = "restricted"   # none | restricted | full
+discover_html = true
+discover_css = true
+discover_js = true
+```
+
+Traffic is classified into three classes:
+
+- `root`: direct target domains. Full audit behavior and configured mutations are allowed.
+- `dependency`: hosts associated with a root through propagation. Auditing remains enabled, but active mutations are restricted by default.
+- `none`: traffic outside the target. With `none_mode = "tunnel"`, CONNECT traffic bypasses MITM; otherwise payload inspection and mutation are disabled.
+
+Root domains can be declared inline in `roots` or loaded from `root_domain_lists`. `*.example.com` is normalized to `example.com`; domain matching covers the apex and subdomains.
+
+The current sample list `lists/audit/targetdomainslist` is configured for AI web-app testing. It includes ChatGPT/OpenAI, Gemini/AI Studio, Claude/Anthropic, Perplexity, Poe, Copilot, Grok/xAI, Mistral, DeepSeek, and Character.AI roots. `Referer` and `Origin` currently propagate dependencies; passive HTML/CSS/JS discovery and `Sec-Fetch-*` enrichment are planned next.
 
 ### HTTP/3 (QUIC) Downstream
 
@@ -573,6 +639,9 @@ regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
 | Masking | `maskedphraselist` | one phrase per line | non-HTML text mutation |
 | Substitution | `substitutionlist` | `search => replace` | mutable text/HTML response |
 | Substitution | `regexsubstitutionlist` | `pattern => replace` | mutable text/HTML response |
+| Request substitution | `requestsubstitutionlist` | `search => replace` | mutable request body |
+| Request substitution | `requestregexsubstitutionlist` | `pattern => replace` | mutable request body |
+| Audit scope | `targetdomainslist` | one domain per line | target-aware root matching |
 | Client | `bannedclientiplist` | IP or CIDR per line | request source IP check |
 | Client | `exceptionclientiplist` | IP or CIDR per line | overrides client IP bans |
 | Client | `e2guardianipgroups` | `IP/CIDR = group` | maps client IPs to profile groups |
@@ -746,6 +815,48 @@ Substitution applies to textual responses, including HTML. For HTML, it runs on 
 
 Regex substitution uses Go/RE2 regular expressions and is compiled during startup/reload. Capture expansion in replacements is supported (`$1`, `$2`, etc.). `max_window_bytes` bounds how many bytes a regex rule may hold to catch matches split across chunks; the default is 65536 and the hard limit is 1048576. A regex that needs to match across more bytes than that window should be made more specific.
 
+## Request Body Substitution
+
+Request substitution applies the same streaming literal/regex machinery to mutable request bodies. It is configured separately from response substitution so uploads are not modified by accident.
+
+```toml
+[request_substitution]
+rule_lists = ["lists/substitution/requestsubstitutionlist"]
+regex_rule_lists = ["lists/substitution/requestregexsubstitutionlist"]
+
+[[request_substitution.rule]]
+search = "LG_IN_TEST"
+replace = "LG_IN_MUTX"
+
+[[request_substitution.regex_rule]]
+pattern = "(?i)(api[_-]?key\\s*[:=]\\s*\")sk-proj-[A-Za-z0-9._-]+(\")"
+replace = "$1[REDACTED]$2"
+max_window_bytes = 4096
+```
+
+Request substitution is intentionally conservative:
+
+- It runs only on mutable textual request bodies such as JSON, text, URL-encoded forms, and selected multipart form data.
+- It skips compressed uploads and unsupported framing.
+- It respects policy/filter bypasses, including `exceptionsitelist` and audit-scope `dependency`/`none` decisions.
+- Broad request regexes that would corrupt CSRF tokens, client-state JWTs, URL-encoded delimiters, or common structural fields are rejected during startup/reload.
+
+Use request regexes as surgical DLP rules, not as broad "redact anything named token" rules. Modern web apps often sign payloads, bind CSRF values to cookies, or require exact JSON structure; changing unrelated values can break the upstream application.
+
+The sample configuration currently enables a test marker:
+
+```text
+LG_IN_TEST => LG_IN_MUTX
+```
+
+Response substitution also has a test marker:
+
+```text
+LG_OUT_TEST => LG_OUT_MUTX
+```
+
+These are useful for verifying that input/output mutation is active inside the configured audit scope. `text/event-stream` responses are not mutated, even though they are textual, because changing streaming deltas can corrupt offsets, citations, and client-side state.
+
 ## External Phrase Lists (e2guardian-style)
 
 Banned phrases, weighted phrases, exception phrases, masking phrases, and substitution rules can also live in plain external files instead of being embedded in `lucidgate.toml`. This is the same idiom e2guardian uses and keeps long lists out of the main TOML.
@@ -766,6 +877,10 @@ lists/
   substitution/
     substitutionlist
     regexsubstitutionlist
+    requestsubstitutionlist
+    requestregexsubstitutionlist
+  audit/
+    targetdomainslist
 ```
 
 Wire the lists from `lucidgate.toml`:
@@ -788,9 +903,17 @@ phrase_lists = ["lists/masking/maskedphraselist"]
 [substitution]
 rule_lists = ["lists/substitution/substitutionlist"]
 regex_rule_lists = ["lists/substitution/regexsubstitutionlist"]
+
+[request_substitution]
+rule_lists = ["lists/substitution/requestsubstitutionlist"]
+regex_rule_lists = ["lists/substitution/requestregexsubstitutionlist"]
+
+[audit_scope]
+enabled = true
+root_domain_lists = ["lists/audit/targetdomainslist"]
 ```
 
-Embedded entries (`blocked_phrases`, `[[semantic.weighted_phrase]]`, `phrases`, `[[substitution.rule]]`, `[[substitution.regex_rule]]`) keep working and are merged with the external entries; embedded values come first.
+Embedded entries (`blocked_phrases`, `[[semantic.weighted_phrase]]`, `phrases`, `[[substitution.rule]]`, `[[substitution.regex_rule]]`, `[[request_substitution.rule]]`, `[[request_substitution.regex_rule]]`, and `audit_scope.roots`) keep working and are merged with the external entries; embedded values come first.
 
 Common parser rules for every list file:
 
@@ -835,6 +958,28 @@ Per-format syntax:
   ```text
   ca.*sa\.png => carcasa.png
   image-([0-9]+)\.png => asset-$1.webp
+  ```
+
+- **requestsubstitutionlist:** `search => replace`, applied to mutable request bodies.
+
+  ```text
+  LG_IN_TEST => LG_IN_MUTX
+  internal codename => public name
+  ```
+
+- **requestregexsubstitutionlist:** `pattern => replace`, compiled as Go/RE2 regexp and applied to mutable request bodies. Keep these rules specific; unsafe broad request regexes are rejected at startup/reload.
+
+  ```text
+  (?i)(api[_-]?key\s*[:=]\s*")sk-proj-[A-Za-z0-9._-]+(") => $1[REDACTED]$2
+  ```
+
+- **targetdomainslist:** one audit root domain per line. These are merged into `[audit_scope].roots`.
+
+  ```text
+  chatgpt.com
+  gemini.google.com
+  claude.ai
+  anthropic.com
   ```
 
 ### Streaming semantics for `exceptionphraselist`

@@ -724,6 +724,74 @@ func TestApplyRuntimeConfigRejectsInvalidRequestSubstitutionRegex(t *testing.T) 
 	}
 }
 
+func TestApplyRuntimeConfigRejectsBroadRequestSubstitutionRegex(t *testing.T) {
+	cfg := appConfig{
+		IOTimeout:     time.Second,
+		WSIdleTimeout: time.Minute,
+		DialTimeout:   time.Second,
+		WaitTimeout:   time.Millisecond,
+		RegexRequestSubstitutions: []RegexSubstitutionConfig{
+			{
+				Pattern: `(?i)token\s*[:=]\s*[A-Za-z0-9._-]+`,
+				Replace: `token=[redacted]`,
+				Source:  "requestregexsubstitutionlist:9",
+			},
+		},
+	}
+	server := proxy.NewServer("127.0.0.1:0", nil)
+	err := applyRuntimeConfig(server, &cfg)
+	if err == nil ||
+		!strings.Contains(err.Error(), "requestregexsubstitutionlist:9") ||
+		!strings.Contains(err.Error(), "protected canary") {
+		t.Fatalf("applyRuntimeConfig() error = %v, want protected canary rejection with source", err)
+	}
+}
+
+func TestValidateRequestRegexSubstitutionRejectsGenericPIIRegex(t *testing.T) {
+	err := validateRequestRegexSubstitutionSafety([]RegexSubstitutionConfig{
+		{
+			Pattern: `\b(?:\d[ -]*?){13,19}\b`,
+			Replace: `[REDACTED_CARD]`,
+			Source:  "requestregexsubstitutionlist:44",
+		},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "requestregexsubstitutionlist:44") ||
+		!strings.Contains(err.Error(), "numeric trace identifiers") {
+		t.Fatalf("validateRequestRegexSubstitutionSafety() error = %v, want generic PII rejection", err)
+	}
+}
+
+func TestValidateRequestRegexSubstitutionRejectsDelimiterCorruption(t *testing.T) {
+	err := validateRequestRegexSubstitutionSafety([]RegexSubstitutionConfig{
+		{
+			Pattern: `(?i)(^|[^a-zA-Z0-9]|%[0-9a-fA-F]{2})(password|passwd|secret|api_key)((?:\s*|%20|\+)*(?::|=|%3A|%3D)(?:\s*|%20|\+|"|%22)*)([^&"'\n\r]+?)(?:%0[AaDd]|%2[267]|\n|\r|&|"|'|$)`,
+			Replace: `$1$2$3[REDACTED_SECRET]`,
+			Source:  "requestregexsubstitutionlist:21",
+		},
+	})
+	if err == nil ||
+		!strings.Contains(err.Error(), "requestregexsubstitutionlist:21") ||
+		!strings.Contains(err.Error(), "global (?i)") {
+		t.Fatalf("validateRequestRegexSubstitutionSafety() error = %v, want delimiter corruption rejection", err)
+	}
+}
+
+func TestValidateRequestRegexSubstitutionAllowsSurgicalDLP(t *testing.T) {
+	err := validateRequestRegexSubstitutionSafety([]RegexSubstitutionConfig{
+		{Pattern: `\bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b`, Replace: `[REDACTED_OPENAI_KEY]`},
+		{Pattern: `\bya29\.[A-Za-z0-9_-]{20,}\b`, Replace: `[REDACTED_GCP_TOKEN]`},
+		{Pattern: `\b(?:s|hvs)\.[A-Za-z0-9_-]{24,}\b`, Replace: `[REDACTED_VAULT_TOKEN]`},
+		{
+			Pattern: `(^|[^a-zA-Z0-9]|%[0-9a-fA-F]{2})((?i:password|passwd|secret|api_key|secret_key|auth_token|private_key))((?:\s*|%20|\+)*(?:"|%22|'|%27)?(?::|=|%3[Aa]|%3[Dd])(?:\s*|%20|\+|"|%22)*)((?:[^&%"'\n\r]+|%(?:[1-9A-Fa-f][0-9A-Fa-f]|0[0-9B-CE-Fa-f]|2[013-57-9A-Fa-f]))+)`,
+			Replace: `${1}${2}${3}[REDACTED_SECRET]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("validateRequestRegexSubstitutionSafety() error = %v", err)
+	}
+}
+
 func TestApplyRuntimeConfigPublishesWSIdleTimeout(t *testing.T) {
 	cfg := appConfig{
 		IOTimeout:        time.Second,
