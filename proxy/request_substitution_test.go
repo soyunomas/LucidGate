@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -77,6 +79,39 @@ func TestRequestSubstitutionLiteralAndRegex(t *testing.T) {
 	gotForm := out.String()
 	if !strings.Contains(gotForm, expectedForm) {
 		t.Errorf("expected Form response to contain %q, got: %q", expectedForm, gotForm)
+	}
+}
+
+func TestRequestSubstitutionHonorsBypassFilters(t *testing.T) {
+	filter, err := NewSubstitutionFilterWithRegex(map[string]string{
+		"LG_IN_TEST": "LG_IN_MUTX",
+	}, nil)
+	if err != nil {
+		t.Fatalf("NewSubstitutionFilterWithRegex() error = %v", err)
+	}
+
+	opts := RelayOptions{
+		RequestSubstitutionFilter: filter,
+		LogBodies:                 true,
+		MaxCaptureBytes:           1024,
+	}
+	body := `{"prompt":"LG_IN_TEST"}`
+	req := httptest.NewRequest(http.MethodPost, "https://claude.ai/api/test", strings.NewReader(body))
+	req = req.WithContext(context.WithValue(req.Context(), BypassFiltersCtxKey{}, true))
+	req.Header.Set("Content-Type", "application/json")
+	req.ContentLength = int64(len(body))
+
+	var out bytes.Buffer
+	cap := newBodyCapture(true, opts)
+	if _, _, err := writeRequestStreaming(&out, req, cap, opts, nil); err != nil {
+		t.Fatalf("writeRequestStreaming() error = %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, body) {
+		t.Fatalf("request body was modified despite bypass filters: %q", got)
+	}
+	if strings.Contains(got, "LG_IN_MUTX") {
+		t.Fatalf("request substitution applied despite bypass filters: %q", got)
 	}
 }
 
@@ -345,7 +380,7 @@ func TestRequestSubstitutionPastebinExfiltration(t *testing.T) {
 			MaxWindowBytes: 128,
 		},
 		{
-			Pattern:        `\b(s\.|hvs\.)[a-zA-Z0-9_-]{24}\b`,
+			Pattern:        `\b(s\.|hvs\.)[a-zA-Z0-9_-]{24,}\b`,
 			Replace:        `[REDACTED_VAULT_TOKEN]`,
 			MaxWindowBytes: 128,
 		},
@@ -355,8 +390,8 @@ func TestRequestSubstitutionPastebinExfiltration(t *testing.T) {
 			MaxWindowBytes: 128,
 		},
 		{
-			Pattern:        `(?i)(^|[^a-zA-Z0-9]|%[0-9a-fA-F]{2})(password|passwd|secret|token|api_key|secret_key|auth_token|private_key)((?:\s*|%20|\+)*(?::|=|%3A|%3D)(?:\s*|%20|\+|"|%22)*)([^&"'\n\r]+?)(?:%0[AaDd]|%2[267]|\n|\r|&|"|'|$)`,
-			Replace:        `$1$2$3[REDACTED_SECRET]`,
+			Pattern:        `(^|[^a-zA-Z0-9]|%[0-9a-fA-F]{2})((?i:password|passwd|secret|api_key|secret_key|auth_token|private_key))((?:\s*|%20|\+)*(?:"|%22|'|%27)?(?::|=|%3[Aa]|%3[Dd])(?:\s*|%20|\+|"|%22)*)((?:[^&%"'\n\r]+|%(?:[1-9A-Fa-f][0-9A-Fa-f]|0[0-9B-CE-Fa-f]|2[013-57-9A-Fa-f]))+)`,
+			Replace:        `${1}${2}${3}[REDACTED_SECRET]`,
 			MaxWindowBytes: 256,
 		},
 		{
@@ -373,6 +408,29 @@ func TestRequestSubstitutionPastebinExfiltration(t *testing.T) {
 
 	opts := RelayOptions{
 		RequestSubstitutionFilter: filter,
+	}
+
+	jsonBody := `{"password":"tiny","token":"s.AbcDeF1234567890aBcDeF123","message":"keep-json-valid"}`
+	reqJSON := httptest.NewRequest(http.MethodPost, "http://localhost/api", strings.NewReader(jsonBody))
+	reqJSON.Header.Set("Content-Type", "application/json")
+	reqJSON.ContentLength = int64(len(jsonBody))
+
+	var outJSON bytes.Buffer
+	capJSON := newBodyCapture(true, opts)
+
+	_, _, err = writeRequestStreaming(&outJSON, reqJSON, capJSON, opts, nil)
+	if err != nil {
+		t.Fatalf("writeRequestStreaming JSON syntax error = %v", err)
+	}
+	jsonParts := strings.SplitN(outJSON.String(), "\r\n\r\n", 2)
+	if len(jsonParts) != 2 {
+		t.Fatalf("serialized JSON request missing body separator: %q", outJSON.String())
+	}
+	if !json.Valid([]byte(jsonParts[1])) {
+		t.Fatalf("request substitution produced invalid JSON body: %q", jsonParts[1])
+	}
+	if strings.Contains(jsonParts[1], "tiny") || strings.Contains(jsonParts[1], "s.AbcDeF") {
+		t.Fatalf("expected JSON secrets to be redacted, got: %q", jsonParts[1])
 	}
 
 	userText := `Asunto: Análisis de urgencia para el despliegue del proyecto NEXUS - Fase 2
@@ -467,7 +525,7 @@ Quedo a la espera de que terminen la migración. Por favor, borren este mensaje 
 	// Test 3: Multipart Form Data request body (simulating browser Pastebin post)
 	var mpBuf bytes.Buffer
 	mpWriter := multipart.NewWriter(&mpBuf)
-	
+
 	_ = mpWriter.WriteField("api_option", "paste")
 	_ = mpWriter.WriteField("api_paste_code", userText)
 	_ = mpWriter.Close()
@@ -542,5 +600,3 @@ func TestRequestSubstitutionBlockOnMatch(t *testing.T) {
 		t.Errorf("expected MatchType 'exfiltration preventer', got %q", dec.MatchType)
 	}
 }
-
-

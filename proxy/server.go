@@ -714,6 +714,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeBlockPage(w, http.StatusForbidden, "Access denied", "LucidGate blocked this destination by domain policy.")
 		return
 	}
+	opts := s.relay.Load().(RelayOptions)
+	if opts.AuditScope != nil {
+		scopeDecision := opts.AuditScope.Decide(r, host)
+		if scopeDecision.Class == AuditClassNone && opts.AuditScope.NoneMode() == AuditNoneModeTunnel {
+			permit, ok, reason := s.acquireConnForProfile(r.Context(), profile)
+			if !ok {
+				ConnectionsRejected.WithLabelValues(reason).Inc()
+				writeBlockPage(w, http.StatusServiceUnavailable, "Connection limit exceeded", "LucidGate is at the configured concurrent connection limit.")
+				return
+			}
+			defer s.releaseConn(permit)
+			s.handleBypassMITM(w, r, host)
+			return
+		}
+	}
 	if s.shouldBypassMITM(host) {
 		permit, ok, reason := s.acquireConnForProfile(r.Context(), profile)
 		if !ok {
@@ -770,6 +785,12 @@ func (s *Server) handlePlainHTTP(w http.ResponseWriter, r *http.Request, profile
 	}
 	if dec.BypassFilters {
 		r = r.WithContext(context.WithValue(r.Context(), BypassFiltersCtxKey{}, true))
+	}
+	scopeDecision := AuditScopeDecision{Class: AuditClassRoot, MutationAllowed: true, InspectAllowed: true, DumpAllowed: true}
+	if opts.AuditScope != nil {
+		scopeDecision = opts.AuditScope.Decide(r, host)
+		r = r.WithContext(WithAuditScopeDecision(r.Context(), scopeDecision))
+		opts = opts.ForAuditScope(scopeDecision)
 	}
 	permit, ok, reason := s.acquireConnForProfile(r.Context(), profile)
 	if !ok {
@@ -1588,6 +1609,11 @@ func (s *Server) handleHTTPSStream(w http.ResponseWriter, r *http.Request, conne
 			return
 		}
 	}
+	if opts.AuditScope != nil {
+		scopeDecision := opts.AuditScope.Decide(upReq, host)
+		upReq = upReq.WithContext(WithAuditScopeDecision(upReq.Context(), scopeDecision))
+		opts = opts.ForAuditScope(scopeDecision)
+	}
 
 	if isHostH2(&s.h2Hosts, host) {
 		s.handleHTTPSStreamH2Upstream(w, upReq, host, xid, opts)
@@ -1756,13 +1782,14 @@ func (s *Server) handleHTTPSStreamH2Upstream(w http.ResponseWriter, req *http.Re
 		var inspect *InspectReader
 		var reqSubInspect *InspectReader
 		origBody := req.Body
+		bypassFilters := requestBypassFilters(req)
 
-		if shouldInspectRequest(req) {
+		if !bypassFilters && shouldInspectRequest(req) {
 			inspect = newInspectReader(origBody, reqFilter(opts.RequestFilter))
 			body = inspect
 		}
 
-		if opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
+		if !bypassFilters && opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
 			if shouldSubstituteRequest(req) {
 				if req.ProtoAtLeast(1, 1) {
 					subEngine := opts.RequestSubstitutionFilter.NewFilter()

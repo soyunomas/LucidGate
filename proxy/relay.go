@@ -35,6 +35,14 @@ import (
 
 type BypassFiltersCtxKey struct{}
 
+func requestBypassFilters(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	bypass, _ := req.Context().Value(BypassFiltersCtxKey{}).(bool)
+	return bypass
+}
+
 // BodyBytesNotCaptured is returned in log fields when the body length is
 // unknown or capture was deliberately skipped.
 const BodyBytesNotCaptured int64 = -1
@@ -88,30 +96,31 @@ var bufioReaderPool = sync.Pool{
 //     of every textual request and response to a single JSONL file inside that
 //     directory, intended for offline Blue-Team inspection.
 type RelayOptions struct {
-	LogBodies                bool
-	LogBodiesSampleRate      float64
-	MaxCaptureBytes          int64
-	DumpDir                  string
-	DumpOnPolicyHit          bool
-	DumpCredentialsCleartext bool
-	AuditKey                 string
-	DumpMaxSizeMB            int
-	DumpMaxBackups           int
-	DumpMinFreeSpaceMB       int64
-	DumpCompress             bool
-	IOTimeout                time.Duration
-	WSIdleTimeout            time.Duration
-	Filter                   FilterEngine
-	RequestFilter            FilterEngine
+	LogBodies                 bool
+	LogBodiesSampleRate       float64
+	MaxCaptureBytes           int64
+	DumpDir                   string
+	DumpOnPolicyHit           bool
+	DumpCredentialsCleartext  bool
+	AuditKey                  string
+	DumpMaxSizeMB             int
+	DumpMaxBackups            int
+	DumpMinFreeSpaceMB        int64
+	DumpCompress              bool
+	IOTimeout                 time.Duration
+	WSIdleTimeout             time.Duration
+	Filter                    FilterEngine
+	RequestFilter             FilterEngine
 	RequestSubstitutionFilter *SubstitutionFilter
-	Policy                   *Policy
-	RoundTripH2              func(*http.Request) (*http.Response, error)
-	H2Hosts                  *sync.Map
-	HTTP3Enabled             bool
-	HTTP3Port                string
-	AccessLogger             *slog.Logger
-	AlertLogger              *slog.Logger
-	AlertCategories          map[string]bool
+	Policy                    *Policy
+	AuditScope                *AuditScope
+	RoundTripH2               func(*http.Request) (*http.Response, error)
+	H2Hosts                   *sync.Map
+	HTTP3Enabled              bool
+	HTTP3Port                 string
+	AccessLogger              *slog.Logger
+	AlertLogger               *slog.Logger
+	AlertCategories           map[string]bool
 }
 
 type FilterEngine interface {
@@ -175,14 +184,14 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 	}()
 
 	exchanges := 0
-	var doH2RoundTrip func(*http.Request, string) error
+	var doH2RoundTrip func(*http.Request, string, RelayOptions) error
 	if opts.RoundTripH2 != nil {
-		doH2RoundTrip = func(req *http.Request, host string) error {
+		doH2RoundTrip = func(req *http.Request, host string, exchangeOpts RelayOptions) error {
 			req.URL.Scheme = "https"
 			req.URL.Host = host
 			req.RequestURI = ""
 
-			resp, err := opts.RoundTripH2(req)
+			resp, err := exchangeOpts.RoundTripH2(req)
 			if err != nil {
 				closeRequestBody(req)
 				return fmt.Errorf("h2 roundtrip: %w", err)
@@ -193,16 +202,16 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 				AltSvcStripped.Inc()
 			}
 
-			if opts.HTTP3Enabled {
-				resp.Header.Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=86400`, opts.HTTP3Port))
+			if exchangeOpts.HTTP3Enabled {
+				resp.Header.Set("Alt-Svc", fmt.Sprintf(`h3=":%s"; ma=86400`, exchangeOpts.HTTP3Port))
 			}
 
-			if opts.Policy != nil {
-				if decision := opts.Policy.EvaluateResponse(resp, "https"); decision.Blocked {
+			if exchangeOpts.Policy != nil {
+				if decision := exchangeOpts.Policy.EvaluateResponse(resp, "https"); decision.Blocked {
 					closeResponseBody(resp)
 					RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
-					logExchangeBlocked(logger, req, decision, opts)
-					if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+					logExchangeBlocked(logger, req, decision, exchangeOpts)
+					if err := setWriteDeadline(localConn, exchangeOpts.IOTimeout); err != nil {
 						return fmt.Errorf("deadline local policy response block write: %w", err)
 					}
 					_, _ = io.WriteString(localConn, policyBlockResponse())
@@ -210,19 +219,19 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 				}
 			}
 
-			respCap := newBodyCapture(resp.Body != nil, opts)
-			if err := setWriteDeadline(localConn, opts.IOTimeout); err != nil {
+			respCap := newBodyCapture(resp.Body != nil, exchangeOpts)
+			if err := setWriteDeadline(localConn, exchangeOpts.IOTimeout); err != nil {
 				closeResponseBody(resp)
 				return fmt.Errorf("deadline local write: %w", err)
 			}
-			resp.Body = readCloserWithIdleDeadline(resp.Body, connReadDeadlineRefresher(localConn, opts.IOTimeout))
-			localWriter := writerWithIdleDeadline(localConn, connWriteDeadlineRefresher(localConn, opts.IOTimeout))
-			_, decision, err := writeResponseStreaming(localWriter, resp, respCap, opts.Filter)
+			resp.Body = readCloserWithIdleDeadline(resp.Body, connReadDeadlineRefresher(localConn, exchangeOpts.IOTimeout))
+			localWriter := writerWithIdleDeadline(localConn, connWriteDeadlineRefresher(localConn, exchangeOpts.IOTimeout))
+			_, decision, err := writeResponseStreaming(localWriter, resp, respCap, exchangeOpts.Filter)
 			if err != nil {
 				closeResponseBody(resp)
 				if decision.Blocked {
 					RuleHits.WithLabelValues("default", decision.MatchType, "block").Inc()
-					logExchangeBlocked(logger, req, decision, opts)
+					logExchangeBlocked(logger, req, decision, exchangeOpts)
 				}
 				return fmt.Errorf("write local response: %w", err)
 			}
@@ -310,6 +319,13 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 			}
 		}
 
+		scopeDecision := AuditScopeDecision{Class: AuditClassRoot, MutationAllowed: true, InspectAllowed: true, DumpAllowed: true}
+		if opts.AuditScope != nil {
+			scopeDecision = opts.AuditScope.Decide(req, host)
+			req = req.WithContext(WithAuditScopeDecision(req.Context(), scopeDecision))
+		}
+		exchangeOpts := opts.ForAuditScope(scopeDecision)
+
 		if isWS {
 			if upstreamConn == nil {
 				if acquire != nil {
@@ -369,8 +385,8 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 			return wsErr
 		}
 
-		if doH2RoundTrip != nil && isHostH2(opts.H2Hosts, host) {
-			if err := doH2RoundTrip(req, host); err != nil {
+		if doH2RoundTrip != nil && isHostH2(exchangeOpts.H2Hosts, host) {
+			if err := doH2RoundTrip(req, host, exchangeOpts); err != nil {
 				return err
 			}
 			if localClose {
@@ -399,7 +415,7 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 					}
 					if errors.Is(err, errNegotiatedH2) {
 						if doH2RoundTrip != nil {
-							if err := doH2RoundTrip(req, host); err != nil {
+							if err := doH2RoundTrip(req, host, exchangeOpts); err != nil {
 								return err
 							}
 							if localClose {
@@ -428,7 +444,6 @@ func relayHTTPConnLease(localConn net.Conn, upstreamConn net.Conn, dial func() (
 			}
 		}
 
-		exchangeOpts := opts
 		if opts.LogBodies && opts.LogBodiesSampleRate > 0 && opts.LogBodiesSampleRate < 1.0 {
 			if rand.Float64() >= opts.LogBodiesSampleRate {
 				exchangeOpts.LogBodies = false
@@ -911,7 +926,8 @@ func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, opt
 	body := io.Reader(req.Body)
 	var inspect *InspectReader
 	var activeFilter FilterEngine
-	if shouldInspectRequest(req) {
+	bypassFilters := requestBypassFilters(req)
+	if !bypassFilters && shouldInspectRequest(req) {
 		activeFilter = reqFilter(opts.RequestFilter)
 		inspect = newInspectReader(req.Body, activeFilter)
 		defer inspect.Close()
@@ -919,7 +935,7 @@ func writeRequestStreaming(w io.Writer, req *http.Request, cap *bodyCapture, opt
 	}
 
 	var reqSubInspect *InspectReader
-	if opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
+	if !bypassFilters && opts.RequestSubstitutionFilter != nil && opts.RequestSubstitutionFilter.HasRules() {
 		if shouldSubstituteRequest(req) {
 			if !req.ProtoAtLeast(1, 1) {
 				RequestSubstitutionSkippedTotal.WithLabelValues("framing").Inc()
@@ -1058,7 +1074,7 @@ func writeResponseStreaming(w io.Writer, resp *http.Response, cap *bodyCapture, 
 	body := io.Reader(resp.Body)
 	originalContentLength := resp.ContentLength
 	var transformed io.ReadCloser
-	
+
 	var bypassFilters bool
 	if resp.Request != nil {
 		if b, ok := resp.Request.Context().Value(BypassFiltersCtxKey{}).(bool); ok && b {
