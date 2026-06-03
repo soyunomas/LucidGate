@@ -4,6 +4,9 @@
 # To activate a rule, copy one example, remove the leading # and adapt it to your environment.
 # You can include another file with: .Include<relative-or-absolute-path>
 #
+# Active AI audit-scope test marker. Type this in a prompt to verify request mutation.
+LG_IN_TEST => LG_IN_MUTX
+#
 # Commented examples:
 # http://example.test => https://example.test
 # internal codename => [redacted]

@@ -1,0 +1,27 @@
+# LucidGate audit scope target domains.
+# Format: one root domain per line. Blank lines and comments are ignored.
+# You can include another file with: .Include<relative-or-absolute-path>
+#
+# AI web apps and their common first-party/API roots for targeted audit tests.
+chatgpt.com
+chat.openai.com
+openai.com
+auth.openai.com
+oaistatic.com
+oaiusercontent.com
+gemini.google.com
+aistudio.google.com
+generativelanguage.googleapis.com
+claude.ai
+anthropic.com
+perplexity.ai
+poe.com
+copilot.microsoft.com
+bingsvc.com
+grok.com
+x.ai
+mistral.ai
+chat.mistral.ai
+deepseek.com
+chat.deepseek.com
+character.ai

@@ -1,17 +1,27 @@
 # LucidGate example list: requestregexsubstitutionlist
 # Format: One regexp streaming substitution per line: pattern => replacement. Use bounded regexes; max window is configured in TOML for inline rules.
 # Lines beginning with # are comments and are ignored by the loader.
-# To activate a rule, copy one example, remove the leading # and adapt it to your environment.
+# Request-body mutation is risky: broad rules can break CSRF tokens, signed JSON/protobuf payloads and browser forms.
+# To activate a rule, copy one surgical example, remove the leading # and adapt it to your environment.
 # You can include another file with: .Include<relative-or-absolute-path>
 #
-# Commented examples:
-# (?i)api[_-]?key\s*[:=]\s*[A-Za-z0-9._-]+ => api_key=[redacted]
-# (?i)password\s*[:=]\s*[^&\s]+ => password=[redacted]
-# (?i)token\s*[:=]\s*[A-Za-z0-9._-]+ => token=[redacted]
-# https?://old\.example\.test/([^\s"\']+) => https://new.example.test/$1
-# (?i)secret\s*[:=]\s*[^,}\s]+ => secret=[redacted]
-# (?i)bearer\s+[A-Za-z0-9._-]+ => bearer [redacted]
-# (?i)client_secret\s*[:=]\s*[^&\s]+ => client_secret=[redacted]
-# (?i)private_key\s*[:=]\s*[^&\s]+ => private_key=[redacted]
-# (?i)access_token\s*[:=]\s*[^&\s]+ => access_token=[redacted]
-# (?i)refresh_token\s*[:=]\s*[^&\s]+ => refresh_token=[redacted]
+# Surgical commented examples:
+#
+# OpenAI API keys.
+# \bsk-(?:proj-)?[A-Za-z0-9_-]{20,}\b => [REDACTED_OPENAI_KEY]
+#
+# Google OAuth access tokens.
+# \bya29\.[A-Za-z0-9_-]{20,}\b => [REDACTED_GCP_TOKEN]
+#
+# HashiCorp Vault tokens.
+# \b(?:s|hvs)\.[A-Za-z0-9_-]{24,}\b => [REDACTED_VAULT_TOKEN]
+#
+# Labeled secrets in text, JSON, query strings and form bodies.
+# The regexp does not consume the final delimiter, so JSON quotes, form separators and newlines survive length-preserved replacement.
+# (^|[^a-zA-Z0-9]|%[0-9a-fA-F]{2})((?i:password|passwd|secret|api_key|secret_key|auth_token|private_key))((?:\s*|%20|\+)*(?:"|%22|'|%27)?(?::|=|%3[Aa]|%3[Dd])(?:\s*|%20|\+|"|%22)*)((?:[^&%"'\n\r]+|%(?:[1-9A-Fa-f][0-9A-Fa-f]|0[0-9B-CE-Fa-f]|2[013-57-9A-Fa-f]))+) => ${1}${2}${3}[REDACTED_SECRET]
+#
+# Internal corporate domains. Replace company.com/corp before enabling.
+# (?i)\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.internal\.(?:company\.com|corp)\b => [INTERNAL_DOMAIN_REDACTED]
+#
+# URL rewrite example. Keep host-specific to avoid mutating arbitrary URLs.
+# https?://old\.example\.test/([^\s"']+) => https://new.example.test/$1
